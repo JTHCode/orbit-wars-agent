@@ -806,11 +806,17 @@ class World:
             + 0.55 * n["frontier_contact_my_exposure"]
             + 0.30 * (1.0 - n["turn_progress"])
         )
+        mode_pressure_boost = (
+            0.32 * self.modes.get("mode_ahead", 0.0)
+            + 0.10 * self.modes.get("mode_even", 0.0)
+            + 0.38 * self.modes.get("mode_behind", 0.0)
+        )
         scores.conversion_pressure = (
             1.05 * n["enemy_vulnerability"]
             + 0.45 * n["my_ship_share_mobile"]
             + 0.40 * n["frontier_contact_enemy_exposure"]
             + 0.25 * n["turn_progress"]
+            + mode_pressure_boost
             - 0.35 * n["threatened_owned_value"]
         )
         scores.final_scoring = (
@@ -941,9 +947,41 @@ class World:
         total = max(1.0, my_total + enemy_total)
         domination = (my_total - enemy_total) / total
         prod_domination = (my_prod - enemy_prod) / max(1.0, my_prod + enemy_prod)
+
+        n = self.phase_signals.normalized
+        ship_share = n.get("my_ship_share_total", 0.5)
+        prod_share = n.get("my_production_share_total", 0.5)
+        frontier_bias = clamp(
+            n.get("frontier_contact_enemy_exposure", 0.0) - n.get("frontier_contact_my_exposure", 0.0),
+            -1.0,
+            1.0,
+        )
+
+        mode_ahead = (
+            0.54 * clamp(prod_share, 0.0, 1.0)
+            + 0.34 * clamp(ship_share, 0.0, 1.0)
+            + 0.12 * (0.5 + 0.5 * frontier_bias)
+        )
+        mode_behind = (
+            0.54 * (1.0 - clamp(prod_share, 0.0, 1.0))
+            + 0.34 * (1.0 - clamp(ship_share, 0.0, 1.0))
+            + 0.12 * (0.5 - 0.5 * frontier_bias)
+        )
+        mode_even = 1.0 - min(1.0, abs(mode_ahead - mode_behind) * 1.85)
+
+        mode_candidates = {
+            "ahead": mode_ahead,
+            "even": mode_even,
+            "behind": mode_behind,
+        }
+        mode = max(mode_candidates, key=mode_candidates.get)
         phase = self.phase()
         return {
             "phase": phase,
+            "mode": mode,
+            "mode_ahead": mode_ahead,
+            "mode_even": mode_even,
+            "mode_behind": mode_behind,
             "emergency_defense": self.phase_overrides.get("emergency_defense", False),
             "my_total": my_total,
             "enemy_total": enemy_total,
@@ -951,8 +989,8 @@ class World:
             "enemy_prod": enemy_prod,
             "domination": domination,
             "prod_domination": prod_domination,
-            "is_behind": domination < -0.18 or prod_domination < -0.18,
-            "is_ahead": domination > 0.16 or prod_domination > 0.16,
+            "is_behind": mode == "behind" or domination < -0.18 or prod_domination < -0.18,
+            "is_ahead": mode == "ahead" or domination > 0.16 or prod_domination > 0.16,
             "is_dominating": domination > 0.34 or prod_domination > 0.30,
             "is_finishing": phase == "endgame" or self.step >= 400,
             "is_opening": phase == "opening",
