@@ -494,6 +494,8 @@ class World:
         self.importance = self._planet_importance()
         self.modes = self._build_modes()
         self.reaction_cache = {}
+        self._phase_signals_cache = None
+        self.compute_phase_signals()
 
     def _parse_comet_paths(self, comet_groups):
         for group in comet_groups:
@@ -747,6 +749,131 @@ class World:
         if my_t > enemy_t + SAFE_NEUTRAL_MARGIN:
             return "enemy_favored", my_t, enemy_t
         return "neutral", my_t, enemy_t
+
+    def compute_phase_signals(self):
+        """Compute and cache normalized strategic phase signals once per turn."""
+        if self._phase_signals_cache is not None:
+            return self._phase_signals_cache
+
+        turn_progress = clamp(self.step / max(1.0, float(EPISODE_STEPS - 1)), 0.0, 1.0)
+        my_prod = float(self.modes.get("my_prod", 0.0))
+        enemy_prod = float(self.modes.get("enemy_prod", 0.0))
+        my_total_ships = float(self.modes.get("my_total", 0.0))
+        enemy_total_ships = float(self.modes.get("enemy_total", 0.0))
+
+        # Neutral value scoring and contest-bucket splits.
+        neutral_total = 0.0
+        neutral_easy = 0.0
+        neutral_contested = 0.0
+        neutral_unsafe = 0.0
+        for target in self.neutral_planets:
+            req = estimate_capture_requirement(self, target)
+            my_t = self.approximate_reaction_time(self.player, target)
+            status, _mt, _et = self.neutral_status(target)
+            eta = max(1.0, float(my_t if my_t < 999 else 45))
+            eta_adjusted_cost = max(1.0, req * (1.0 + 0.028 * eta))
+            production_weight = 9.0 * target.production
+            strategic_weight = self.importance.get(target.id, 1.0)
+            value = (production_weight + strategic_weight) / eta_adjusted_cost
+            neutral_total += value
+            if status == "safe":
+                neutral_easy += value
+            elif status == "contested":
+                neutral_contested += value
+            elif status == "enemy_favored":
+                neutral_unsafe += value
+
+        neutral_norm = neutral_total / (neutral_total + 25.0)
+        neutral_value_remaining = clamp(neutral_norm, 0.0, 1.0)
+        easy_neutral_value_remaining = clamp(neutral_easy / (neutral_total + 1.0), 0.0, 1.0)
+        contested_neutral_value_remaining = clamp(neutral_contested / (neutral_total + 1.0), 0.0, 1.0)
+        unsafe_neutral_value_remaining = clamp(neutral_unsafe / (neutral_total + 1.0), 0.0, 1.0)
+
+        my_production_share_total = clamp(my_prod / max(1.0, my_prod + enemy_prod), 0.0, 1.0)
+        strongest_enemy_prod = max([0.0] + [float(self.enemy_prod_by_owner.get(o, 0.0)) for o in self.enemy_owner_ids])
+        my_production_share_vs_strongest = clamp(my_prod / max(1.0, my_prod + strongest_enemy_prod), 0.0, 1.0)
+        my_ship_share_total = clamp(my_total_ships / max(1.0, my_total_ships + enemy_total_ships), 0.0, 1.0)
+        my_mobile_ship_share_vs_enemies = clamp(
+            float(self.fleet_ships_by_owner.get(self.player, 0.0))
+            / max(1.0, float(self.fleet_ships_by_owner.get(self.player, 0.0)) + float(sum(self.fleet_ships_by_owner.get(o, 0.0) for o in self.enemy_owner_ids))),
+            0.0,
+            1.0,
+        )
+        enemy_ship_pressure = clamp(enemy_total_ships / max(1.0, my_total_ships), 0.0, 2.0)
+
+        # Frontier / contact pressure from nearest cross-front distances.
+        frontier_scores = []
+        for mine in self.my_planets:
+            best = 999.0
+            for enemy in self.enemy_planets:
+                d = dist_xy(mine.x, mine.y, enemy.x, enemy.y) - mine.radius - enemy.radius
+                if d < best:
+                    best = d
+            if best < 999.0:
+                frontier_scores.append(1.0 / max(6.0, best))
+        frontier_contact = clamp(sum(frontier_scores) / max(1.0, len(frontier_scores) * 0.12), 0.0, 1.0)
+
+        threatened_owned_value = 0.0
+        owned_total_value = 0.0
+        enemy_vulnerability = 0.0
+        enemy_total_value = 0.0
+        for p in self.my_planets:
+            v = self.importance.get(p.id, 1.0)
+            owned_total_value += v
+            loss_eta = first_loss_eta(self, p, DEFENSE_HORIZON)
+            if loss_eta is not None:
+                threatened_owned_value += v / max(1.0, loss_eta / 12.0)
+        for p in self.enemy_planets:
+            v = self.importance.get(p.id, 1.0)
+            enemy_total_value += v
+            pressure = float(self.enemy_source_pressure.get(p.id, 0))
+            owner_at, ships_at = self.estimated_owner_after(p, min(18, ATTACK_HORIZON))
+            if pressure > 0.0 or (owner_at == p.owner and ships_at < p.ships * 0.72):
+                enemy_vulnerability += v
+        threatened_owned_value = clamp(threatened_owned_value / max(1.0, owned_total_value), 0.0, 1.0)
+        enemy_vulnerability = clamp(enemy_vulnerability / max(1.0, enemy_total_value), 0.0, 1.0)
+
+        comet_total = 0.0
+        comet_reachable = 0.0
+        for c in self.planets:
+            if c.id not in self.comet_ids:
+                continue
+            left = self.comet_turns_left(c)
+            if left <= 0:
+                continue
+            val = (5.0 * c.production + 0.45 * self.importance.get(c.id, 1.0)) * clamp(left / 40.0, 0.15, 1.0)
+            comet_total += val
+            if self.approximate_reaction_time(self.player, c) <= left:
+                comet_reachable += val
+        comet_window_value = clamp(comet_reachable / max(1.0, comet_total), 0.0, 1.0)
+
+        # Final-phase payback trigger feasibility.
+        turns_left = float(self.turns_remaining())
+        payback_horizon = min(60.0, turns_left)
+        payback_feasibility = clamp(
+            (my_prod * payback_horizon + my_total_ships) / max(1.0, enemy_prod * payback_horizon + enemy_total_ships),
+            0.0,
+            2.0,
+        )
+
+        self._phase_signals_cache = {
+            "turn_progress": turn_progress,
+            "neutral_value_remaining": neutral_value_remaining,
+            "easy_neutral_value_remaining": easy_neutral_value_remaining,
+            "contested_neutral_value_remaining": contested_neutral_value_remaining,
+            "unsafe_neutral_value_remaining": unsafe_neutral_value_remaining,
+            "my_production_share_total": my_production_share_total,
+            "my_production_share_vs_strongest": my_production_share_vs_strongest,
+            "my_ship_share_total": my_ship_share_total,
+            "my_mobile_ship_share_vs_enemies": my_mobile_ship_share_vs_enemies,
+            "enemy_ship_pressure": enemy_ship_pressure,
+            "frontier_contact": frontier_contact,
+            "threatened_owned_value": threatened_owned_value,
+            "enemy_vulnerability": enemy_vulnerability,
+            "comet_window_value": comet_window_value,
+            "payback_feasibility": payback_feasibility,
+        }
+        return self._phase_signals_cache
 
 
 # ============================================================
