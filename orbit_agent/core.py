@@ -563,8 +563,15 @@ class World:
             self.arrivals_by_planet[a.planet_id].append(a)
         for pid in self.arrivals_by_planet:
             self.arrivals_by_planet[pid].sort(key=lambda a: a.eta)
+        # Bootstrap available ships for phase-signal synthesis before phase state exists.
+        self.available_ships = {p.id: int(p.ships) for p in self.my_planets}
 
+        # Bootstrap caches/importance so phase-signal generation can reference them safely.
+        self.reaction_cache = {}
+        self.importance = {}
+        self.phase_signals = self.compute_phase_signals()
         self.importance = self._planet_importance()
+        # Recompute phase signals now that importance is available to avoid stale values.
         self.phase_signals = self.compute_phase_signals()
         self.phase_overrides = {"emergency_defense": False}
         self._refresh_phase_overrides(self.phase_signals)
@@ -572,7 +579,8 @@ class World:
         # initial mode synthesis.
         self.modes = {"mode_ahead": 0.0, "mode_even": 1.0, "mode_behind": 0.0}
         self.modes = self._build_modes()
-        self.reaction_cache = {}
+        # Recompute with full budgeting once phase/mode state is initialized.
+        self.available_ships = {p.id: projected_ship_budget(self, p) for p in self.my_planets}
 
     def compute_phase_signals(self):
         """Build phase signals consumed by phase/mode and mission logic."""
@@ -1014,7 +1022,7 @@ class World:
                 if avail < MIN_LAUNCH:
                     continue
                 probe = int(min(avail, max(MIN_LAUNCH, 10 if target.owner == NEUTRAL_OWNER else 14)))
-                sol = solve_launch_to_planet(self, src, target, probe, max_turns=ATTACK_HORIZON)
+                sol = solve_launch_discrete(self, src, target, probe, max_turns=ATTACK_HORIZON, require_clear=True)
                 if sol is None:
                     continue
                 best = sol.eta if best is None else min(best, sol.eta)
