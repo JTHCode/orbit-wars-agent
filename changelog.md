@@ -31,6 +31,13 @@ This changelog is maintained by agents working in this repository.
 
 ---
 
+## 2026-05-21 — Add phase hysteresis, guardrails, emergency defense, and transition diagnostics
+
+- Summary: Implemented `select_phase_with_hysteresis(...)` with margin/persistence gates, endgame and pressure guardrails, emergency defense mode signaling, and rich transition diagnostics in runtime stats; wired `phase()` through the selector and regenerated `main.py`.
+- Why: Reduce phase flapping, prevent premature/unsafe strategic mode shifts, and improve offline replay analysis of phase transitions.
+- Impact: More stable strategic phase control with explicit override and debug metadata; no API/signature changes.
+- Files: `orbit_agent/core.py`, `main.py`, `changelog.md`
+
 ## 2026-05-21 — Add agent-maintained changelog and expand agent guidance
 
 - Summary: Added `changelog.md` and expanded `agents.md` with project-specific guidance for modular development, submission build workflow, testing, and maintenance expectations.
