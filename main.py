@@ -217,6 +217,25 @@ class RuntimeStats:
         if elapsed > self.max_t:
             self.max_t = elapsed
 
+
+
+    def record_phase(self, game_turn, phase_diag):
+        self.phase_diag = dict(phase_diag or {})
+        self.phase_diag["game_turn"] = int(game_turn)
+
+        phase = self.phase_diag.get("current_phase")
+        prev = self.phase_diag.get("previous_phase")
+        if phase and prev and phase != prev:
+            event = {
+                "turn": int(game_turn),
+                "from": prev,
+                "to": phase,
+                "reason_bits": list(self.phase_diag.get("transition_reason_bits", [])),
+            }
+            self.phase_transitions.append(event)
+            if len(self.phase_transitions) > 128:
+                self.phase_transitions = self.phase_transitions[-128:]
+
     def as_dict(self):
         return {
             "global_turns": self.turns,
@@ -226,6 +245,8 @@ class RuntimeStats:
             "max_turn_time": round(self.max_t, 5),
             "last_turn_time": round(self.last, 5),
             "last_error": self.last_error,
+            "phase_diagnostics": self.phase_diag,
+            "phase_transitions": list(self.phase_transitions[-16:]),
             "last_phase_transition": self.last_phase_transition,
         }
 
@@ -513,6 +534,8 @@ class World:
         self.reaction_cache = {}
         self.importance = self._planet_importance()
         self.modes = self._build_modes()
+        self.reaction_cache = {}
+        self._phase_cache = None
 
     def _parse_comet_paths(self, comet_groups):
         for group in comet_groups:
@@ -601,6 +624,31 @@ class World:
         ans = (p.x, p.y)
         self._future_xy_cache[key] = ans
         return ans
+
+    def phase_scores(self):
+        progress = self.step / max(1.0, float(EPISODE_STEPS))
+        my_total = sum(p.ships for p in self.my_planets) + sum(f.ships for f in self.fleets if f.owner == self.player)
+        enemy_total = sum(p.ships for p in self.enemy_planets) + sum(f.ships for f in self.fleets if f.owner != self.player)
+        my_prod = sum(p.production for p in self.my_planets)
+        enemy_prod = sum(p.production for p in self.enemy_planets)
+
+        norm_ship_delta = (my_total - enemy_total) / max(1.0, my_total + enemy_total)
+        norm_prod_delta = (my_prod - enemy_prod) / max(1.0, my_prod + enemy_prod)
+        enemy_pressure = min(1.0, len(self.enemy_planets) / max(1.0, len(self.planets)))
+
+        signals = {
+            "progress": progress,
+            "ship_delta": norm_ship_delta,
+            "prod_delta": norm_prod_delta,
+            "enemy_pressure": enemy_pressure,
+        }
+        scores = {
+            "opening": (1.0 - progress) * 1.35 - enemy_pressure * 0.25,
+            "mid": 1.15 - abs(progress - 0.35) * 2.1 + (1.0 - abs(norm_prod_delta)) * 0.10,
+            "pressure": 0.95 - abs(progress - 0.62) * 2.0 + (-norm_ship_delta) * 0.35 + enemy_pressure * 0.20,
+            "endgame": progress * 1.45 + norm_ship_delta * 0.25,
+        }
+        return scores, signals
 
     def phase(self):
         return self.select_phase_with_hysteresis()

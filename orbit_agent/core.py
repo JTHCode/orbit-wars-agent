@@ -245,6 +245,25 @@ class RuntimeStats:
         if elapsed > self.max_t:
             self.max_t = elapsed
 
+
+
+    def record_phase(self, game_turn, phase_diag):
+        self.phase_diag = dict(phase_diag or {})
+        self.phase_diag["game_turn"] = int(game_turn)
+
+        phase = self.phase_diag.get("current_phase")
+        prev = self.phase_diag.get("previous_phase")
+        if phase and prev and phase != prev:
+            event = {
+                "turn": int(game_turn),
+                "from": prev,
+                "to": phase,
+                "reason_bits": list(self.phase_diag.get("transition_reason_bits", [])),
+            }
+            self.phase_transitions.append(event)
+            if len(self.phase_transitions) > 128:
+                self.phase_transitions = self.phase_transitions[-128:]
+
     def as_dict(self):
         return {
             "global_turns": self.turns,
@@ -254,6 +273,8 @@ class RuntimeStats:
             "max_turn_time": round(self.max_t, 5),
             "last_turn_time": round(self.last, 5),
             "last_error": self.last_error,
+            "phase_diagnostics": self.phase_diag,
+            "phase_transitions": list(self.phase_transitions[-16:]),
             "last_phase_transition": self.last_phase_transition,
         }
 
@@ -560,6 +581,7 @@ class World:
         self.importance = self._planet_importance()
         self.modes = self._build_modes()
         self.reaction_cache = {}
+        self._phase_cache = None
         self._phase_signals_cache = None
         self.compute_phase_signals()
 
