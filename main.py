@@ -56,6 +56,14 @@ MAX_SWARM_SOURCES = 5
 OPENING_END = 60
 MID_END = 110
 PRESSURE_END = 160
+PHASE_SWITCH_MARGIN_DEFAULT = 0.07
+PHASE_SWITCH_STREAK_DEFAULT = 2
+ENDGAME_MIN_TURNS_REMAINING = 55
+ENDGAME_MIN_DOMINATION = -0.12
+ENDGAME_MIN_PROD_DOMINATION = -0.15
+EXPANSION_LOW_VALUE_THRESHOLD = 0.85
+EXPANSION_HIGH_PRESSURE_THRESHOLD = 0.62
+EMERGENCY_DEFENSE_CRITICAL_THREAT = 0.78
 SAFE_NEUTRAL_MARGIN = 2
 CONTESTED_NEUTRAL_MARGIN = 4
 HOSTILE_SWARM_TOL = 2
@@ -188,6 +196,8 @@ class RuntimeStats:
         self.max_t = 0.0
         self.last = 0.0
         self.last_error = None
+        self.phase_hysteresis = {}
+        self.last_phase_transition = None
 
     def record(self, elapsed):
         self.turns += 1
@@ -208,6 +218,7 @@ class RuntimeStats:
             "max_turn_time": round(self.max_t, 5),
             "last_turn_time": round(self.last, 5),
             "last_error": self.last_error,
+            "last_phase_transition": self.last_phase_transition,
         }
 
 
@@ -491,9 +502,9 @@ class World:
         for pid in self.arrivals_by_planet:
             self.arrivals_by_planet[pid].sort(key=lambda a: a.eta)
 
+        self.reaction_cache = {}
         self.importance = self._planet_importance()
         self.modes = self._build_modes()
-        self.reaction_cache = {}
 
     def _parse_comet_paths(self, comet_groups):
         for group in comet_groups:
@@ -584,13 +595,104 @@ class World:
         return ans
 
     def phase(self):
-        if self.step < OPENING_END:
-            return "opening"
-        if self.step < MID_END:
-            return "mid"
-        if self.step < PRESSURE_END:
-            return "pressure"
-        return "endgame"
+        return self.select_phase_with_hysteresis()
+
+    def _phase_scores(self):
+        step_opening = 1.0 - min(1.0, self.step / max(1.0, float(OPENING_END)))
+        step_endgame = 1.0 if self.step >= PRESSURE_END else max(0.0, (self.step - MID_END) / max(1.0, float(PRESSURE_END - MID_END)))
+        enemy_prod = sum(p.production for p in self.enemy_planets)
+        my_prod = sum(p.production for p in self.my_planets)
+        my_total = sum(p.ships for p in self.my_planets) + sum(f.ships for f in self.fleets if f.owner == self.player)
+        enemy_total = sum(p.ships for p in self.enemy_planets) + sum(f.ships for f in self.fleets if f.owner != self.player)
+        dom = (my_total - enemy_total) / max(1.0, my_total + enemy_total)
+        prod_dom = (my_prod - enemy_prod) / max(1.0, my_prod + enemy_prod)
+        easy_neutral_value = 0.0
+        for p in self.neutral_planets:
+            my_t = self.approximate_reaction_time(self.player, p)
+            enemy_t = min([self.approximate_reaction_time(owner, p) for owner in self.enemy_owner_ids] or [999])
+            if my_t <= enemy_t + 1 and my_t < 999:
+                easy_neutral_value += p.production / max(1.0, my_t)
+        enemy_frontier_pressure = 0.0
+        for e in self.enemy_planets:
+            best = min((dist_xy(e.x, e.y, m.x, m.y) for m in self.my_planets), default=99.0)
+            enemy_frontier_pressure += e.production / max(10.0, best)
+        threatened_owned_value = 0.0
+        for m in self.my_planets:
+            risk = estimate_threat_score(self, m)
+            threatened_owned_value += self.importance.get(m.id, 1.0) * risk
+        total_owned_importance = max(1.0, sum(self.importance.get(m.id, 1.0) for m in self.my_planets))
+        threatened_owned_value = threatened_owned_value / total_owned_importance
+        scores = {
+            "opening": 1.3 * step_opening + 0.25 * max(0.0, easy_neutral_value - 0.8),
+            "mid": 0.75 + 0.25 * (1.0 - abs(dom)),
+            "pressure": 0.35 + 0.75 * max(0.0, enemy_frontier_pressure - 0.3),
+            "endgame": 0.35 + 0.45 * step_endgame + 0.35 * max(0.0, dom),
+            "easy_neutral_value": easy_neutral_value,
+            "enemy_frontier_pressure": enemy_frontier_pressure,
+            "threatened_owned_value": threatened_owned_value,
+            "domination": dom,
+            "prod_domination": prod_dom,
+        }
+        return scores
+
+    def select_phase_with_hysteresis(self):
+        phase_order = ("opening", "mid", "pressure", "endgame")
+        scores = self._phase_scores()
+        phase_scores = {k: scores[k] for k in phase_order}
+        candidate = max(phase_order, key=lambda p: phase_scores[p])
+        game_key = _RUNTIME.game_key
+        state = _RUNTIME.phase_hysteresis.setdefault(game_key, {"phase": "opening", "streak_phase": None, "streak": 0})
+        prev_phase = state.get("phase", "opening")
+        current_score = phase_scores.get(prev_phase, 0.0)
+        candidate_score = phase_scores[candidate]
+        margin = PHASE_SWITCH_MARGIN_DEFAULT
+        margin_pass = (candidate != prev_phase) and (candidate_score - current_score >= margin)
+
+        streak_cfg = {("opening", "mid"): 2, ("mid", "pressure"): 2, ("pressure", "endgame"): 3}
+        needed_streak = streak_cfg.get((prev_phase, candidate), PHASE_SWITCH_STREAK_DEFAULT)
+        if candidate == state.get("streak_phase"):
+            state["streak"] = int(state.get("streak", 0)) + 1
+        else:
+            state["streak_phase"] = candidate
+            state["streak"] = 1
+        persistence_pass = state["streak"] >= needed_streak
+
+        turns_remaining = self.turns_remaining()
+        endgame_guardrail = True
+        if candidate == "endgame":
+            endgame_guardrail = (
+                turns_remaining <= ENDGAME_MIN_TURNS_REMAINING
+                or scores["domination"] >= ENDGAME_MIN_DOMINATION
+                or scores["prod_domination"] >= ENDGAME_MIN_PROD_DOMINATION
+            )
+        expansion_guardrail = not (
+            prev_phase == "pressure"
+            and candidate == "pressure"
+            and scores["easy_neutral_value"] < EXPANSION_LOW_VALUE_THRESHOLD
+            and scores["enemy_frontier_pressure"] > EXPANSION_HIGH_PRESSURE_THRESHOLD
+        )
+
+        should_switch = margin_pass and persistence_pass and endgame_guardrail and expansion_guardrail
+        new_phase = candidate if should_switch else prev_phase
+        state["phase"] = new_phase
+
+        _RUNTIME.last_phase_transition = {
+            "turn": int(self.step),
+            "prev_phase": prev_phase,
+            "new_phase": new_phase,
+            "candidate_phase": candidate,
+            "scores": {k: round(v, 4) for k, v in phase_scores.items()},
+            "score_delta": round(candidate_score - current_score, 4),
+            "margin_pass": bool(margin_pass),
+            "persistence_pass": bool(persistence_pass),
+            "endgame_guardrail": bool(endgame_guardrail),
+            "expansion_guardrail": bool(expansion_guardrail),
+            "needed_streak": int(needed_streak),
+            "streak": int(state.get("streak", 0)),
+            "turns_remaining": int(turns_remaining),
+            "threatened_owned_value": round(scores["threatened_owned_value"], 4),
+        }
+        return new_phase
 
     def turns_remaining(self):
         return max(0, EPISODE_STEPS - self.step)
@@ -667,6 +769,7 @@ class World:
         domination = (my_total - enemy_total) / total
         prod_domination = (my_prod - enemy_prod) / max(1.0, my_prod + enemy_prod)
         phase = self.phase()
+        threatened_owned_value = self._phase_scores()["threatened_owned_value"]
         return {
             "phase": phase,
             "my_total": my_total,
@@ -680,6 +783,8 @@ class World:
             "is_dominating": domination > 0.34 or prod_domination > 0.30,
             "is_finishing": phase == "endgame" or self.step >= 400,
             "is_opening": phase == "opening",
+            "emergency_defense": threatened_owned_value >= EMERGENCY_DEFENSE_CRITICAL_THREAT,
+            "threatened_owned_value": threatened_owned_value,
         }
 
     def comet_turns_left(self, comet):
