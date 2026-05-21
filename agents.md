@@ -2,6 +2,63 @@
 
 This guide walks you through building an agent, testing it locally, and submitting it to the Orbit Wars competition on Kaggle.
 
+## Repo Structure
+
+- `orbit-roi-v7.ipynb`: original notebook workflow and experimentation history.
+- `orbit_agent/core.py`: primary production agent logic used for submission builds.
+- `orbit_agent/benchmark.py`: reproducible A/B benchmark harness and seed buckets.
+- `orbit_agent/__init__.py`: package exports for `agent` and `get_agent_stats`.
+- `scripts/build_submission.py`: build script that generates a Kaggle-ready single-file `main.py`.
+- `main.py`: generated submission artifact (rebuild before submitting).
+
+**Maintenance rule for agents:** If you add, remove, rename, or repurpose repository files/folders in a way that changes this layout, you must update this Repo Structure section in the same change.
+
+## Agent Playbook (Project-Specific)
+
+### Source of truth and submission flow
+
+- **Primary editable source** for bot behavior is `orbit_agent/core.py`.
+- `main.py` is a **generated submission artifact**; regenerate it after any `orbit_agent/core.py` change by running:
+  - `python scripts/build_submission.py`
+- Avoid hand-editing `main.py` unless absolutely necessary; if you do, sync the same change back into `orbit_agent/core.py` immediately.
+
+### Module ownership and boundaries
+
+- `orbit_agent/core.py`: production agent logic (physics helpers, world model, planning, `agent`).
+- `orbit_agent/benchmark.py`: local A/B benchmark harness only (no competition runtime dependency).
+- `scripts/build_submission.py`: deterministic build path from modular source to Kaggle `main.py`.
+- Keep benchmark-only code out of production agent paths.
+
+### Safe change workflow for agents
+
+1. Read `agents.md`, `competition_overview.md`, and recent `changelog.md` entries before implementing.
+2. Make focused changes in the smallest relevant module.
+3. Rebuild submission artifact with `python scripts/build_submission.py` when agent logic changes.
+4. Run quick checks (`py_compile` and any targeted smoke checks).
+5. Update `changelog.md` with a new entry.
+6. If repo layout changed, update **Repo Structure** in this file in the same change.
+
+### Rules to avoid regressions and duplicate work
+
+- Do not duplicate constants/functions across modules; extend existing helpers in-place when possible.
+- Preserve physics semantics from `competition_overview.md` (continuous segment collision, documented turn order).
+- Keep function signatures stable unless a change is required; if changed, update all call sites atomically.
+- For bug fixes, include a short comment near tricky physics logic explaining the rule being enforced.
+
+### Testing guidance for agents
+
+- Minimum checks after code edits:
+  - `python scripts/build_submission.py`
+  - `python -m py_compile orbit_agent/core.py orbit_agent/benchmark.py main.py scripts/build_submission.py`
+- For behavioral changes, run at least one local game smoke test before finalizing.
+- For performance/strategy changes, prefer running `run_ab_benchmark` in `orbit_agent/benchmark.py` with fixed seeds.
+
+### Documentation maintenance expectations
+
+- Treat `agents.md` and `changelog.md` as living project docs.
+- Update `agents.md` when workflows, architecture, conventions, or critical assumptions change.
+- Update `changelog.md` for every meaningful change (code or docs) so future agents can quickly recover context.
+
 ## Game Overview
 
 Orbit Wars is a real-time strategy game on a 100x100 board with a sun at the center. Players conquer planets by sending fleets of ships between them.
