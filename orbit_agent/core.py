@@ -3,7 +3,7 @@
 import math
 import time
 from dataclasses import dataclass, field
-from collections import defaultdict
+from collections import defaultdict, deque
 from itertools import combinations
 
 # ============================================================
@@ -122,6 +122,31 @@ COMET_EVAC_ATTACK_BONUS = 1.20
 # Timing debug. Keep False for submissions.
 DEBUG_TIMING_PRINTS = False
 DEBUG_PRINT_EVERY = 50
+
+
+PHASE_EXPANSION_RACE = "expansion_race"
+PHASE_BORDER_CONTEST = "border_contest"
+PHASE_CONVERSION_PRESSURE = "conversion_pressure"
+PHASE_FINAL_SCORING = "final_scoring"
+
+PHASE_LABELS = (
+    PHASE_EXPANSION_RACE,
+    PHASE_BORDER_CONTEST,
+    PHASE_CONVERSION_PRESSURE,
+    PHASE_FINAL_SCORING,
+)
+
+PHASE_COMPAT_MAP = {
+    PHASE_EXPANSION_RACE: "opening",
+    PHASE_BORDER_CONTEST: "mid",
+    PHASE_CONVERSION_PRESSURE: "pressure",
+    PHASE_FINAL_SCORING: "endgame",
+}
+
+_PHASE_MEMORY = {}
+PHASE_HISTORY_WINDOW = 6
+PHASE_SWITCH_MARGIN = 0.18
+PHASE_MIN_PERSISTENCE = 4
 
 
 @dataclass
@@ -505,6 +530,27 @@ class World:
         self.reaction_cache = {}
         self.importance = self._planet_importance()
         self.modes = self._build_modes()
+        self.modes_snapshot = self._build_modes_base()
+        self.phase_state = self._init_phase_state()
+        phase_signals = self.compute_phase_signals()
+        phase_scores = self.compute_phase_scores(phase_signals)
+        self.phase_state["current_phase"] = self.select_phase_with_hysteresis(
+            phase_scores,
+            self.phase_state["current_phase"],
+            self.phase_state,
+        )
+        _PHASE_MEMORY[_RUNTIME.game_key] = {
+            "current_phase": self.phase_state["current_phase"],
+            "phase_persistence_turns": self.phase_state["phase_persistence_turns"],
+            "last_phase_change_step": self.phase_state["last_phase_change_step"],
+            "score_history": {k: list(v) for k, v in self.phase_state["score_history"].items()},
+        }
+
+        self.importance = self._planet_importance()
+        self.modes = self._build_modes()
+        self.reaction_cache = {}
+        self._phase_signals_cache = None
+        self.compute_phase_signals()
 
     def _parse_comet_paths(self, comet_groups):
         for group in comet_groups:
@@ -593,6 +639,89 @@ class World:
         ans = (p.x, p.y)
         self._future_xy_cache[key] = ans
         return ans
+
+    def _init_phase_state(self):
+        key = _RUNTIME.game_key or self._make_game_key(self.obs)
+        prev = _PHASE_MEMORY.get(key, {})
+        hist = {}
+        prev_hist = prev.get("score_history", {})
+        for label in PHASE_LABELS:
+            hist[label] = deque(prev_hist.get(label, []), maxlen=PHASE_HISTORY_WINDOW)
+        return {
+            "current_phase": prev.get("current_phase", PHASE_EXPANSION_RACE),
+            "phase_persistence_turns": int(prev.get("phase_persistence_turns", 0)),
+            "last_phase_change_step": int(prev.get("last_phase_change_step", 0)),
+            "score_history": hist,
+        }
+
+    def compute_phase_signals(self):
+        my_count = len(self.my_planets)
+        neutral_count = len(self.neutral_planets)
+        enemy_count = len(self.enemy_planets)
+        total_count = max(1, len(self.planets))
+        neutral_ratio = neutral_count / total_count
+        enemy_ratio = enemy_count / total_count
+        fleet_ratio = sum(f.ships for f in self.fleets) / max(1.0, sum(p.ships for p in self.planets))
+        turns_remaining = self.turns_remaining()
+        return {
+            "step": float(self.step),
+            "my_count": float(my_count),
+            "neutral_ratio": neutral_ratio,
+            "enemy_ratio": enemy_ratio,
+            "domination": self.modes_snapshot["domination"],
+            "prod_domination": self.modes_snapshot["prod_domination"],
+            "fleet_ratio": fleet_ratio,
+            "turns_remaining": float(turns_remaining),
+        }
+
+    def compute_phase_scores(self, signals):
+        step = signals["step"]
+        scores = {label: 0.0 for label in PHASE_LABELS}
+        scores[PHASE_EXPANSION_RACE] += 1.6 * signals["neutral_ratio"] + 0.5 * (1.0 - signals["enemy_ratio"])
+        scores[PHASE_BORDER_CONTEST] += 1.2 * signals["enemy_ratio"] + 0.8 * abs(signals["domination"])
+        scores[PHASE_CONVERSION_PRESSURE] += 1.0 * signals["fleet_ratio"] + 1.0 * max(0.0, signals["prod_domination"])
+        scores[PHASE_FINAL_SCORING] += 2.2 * (1.0 - min(1.0, signals["turns_remaining"] / 120.0))
+
+        # Soft priors / guardrails only.
+        if step < OPENING_END:
+            scores[PHASE_EXPANSION_RACE] += 0.55
+        elif step < MID_END:
+            scores[PHASE_BORDER_CONTEST] += 0.45
+        elif step < PRESSURE_END:
+            scores[PHASE_CONVERSION_PRESSURE] += 0.35
+        else:
+            scores[PHASE_FINAL_SCORING] += 0.55
+        return scores
+
+    def select_phase_with_hysteresis(self, scores, current_phase, persistence_meta):
+        history = persistence_meta["score_history"]
+        for label, score in scores.items():
+            history[label].append(score)
+        rolling = {label: (sum(vals) / max(1, len(vals))) for label, vals in history.items()}
+
+        best_phase = max(PHASE_LABELS, key=lambda label: rolling[label])
+        if current_phase not in PHASE_LABELS:
+            current_phase = PHASE_EXPANSION_RACE
+        current_score = rolling[current_phase]
+        best_score = rolling[best_phase]
+
+        persistence_turns = int(persistence_meta.get("phase_persistence_turns", 0)) + 1
+        if best_phase != current_phase and (
+            persistence_turns < PHASE_MIN_PERSISTENCE or
+            (best_score - current_score) < PHASE_SWITCH_MARGIN
+        ):
+            best_phase = current_phase
+            persistence_turns += 1
+        elif best_phase != current_phase:
+            persistence_turns = 0
+            persistence_meta["last_phase_change_step"] = self.step
+
+        persistence_meta["phase_persistence_turns"] = persistence_turns
+        persistence_meta["current_phase"] = best_phase
+        return best_phase
+
+    def _compat_phase_label(self, phase_label):
+        return PHASE_COMPAT_MAP.get(phase_label, "opening")
 
     def phase(self):
         return self.select_phase_with_hysteresis()
@@ -693,6 +822,7 @@ class World:
             "threatened_owned_value": round(scores["threatened_owned_value"], 4),
         }
         return new_phase
+        return self._compat_phase_label(self.phase_state["current_phase"])
 
     def turns_remaining(self):
         return max(0, EPISODE_STEPS - self.step)
@@ -752,7 +882,7 @@ class World:
             vals[p.id] = max(1.0, val)
         return vals
 
-    def _build_modes(self):
+    def _build_modes_base(self):
         my_planet_ships = sum(p.ships for p in self.my_planets)
         my_fleet_ships = sum(f.ships for f in self.fleets if f.owner == self.player)
         my_total = my_planet_ships + my_fleet_ships
@@ -771,7 +901,7 @@ class World:
         phase = self.phase()
         threatened_owned_value = self._phase_scores()["threatened_owned_value"]
         return {
-            "phase": phase,
+            "phase": None,
             "my_total": my_total,
             "enemy_total": enemy_total,
             "my_prod": my_prod,
@@ -785,7 +915,19 @@ class World:
             "is_opening": phase == "opening",
             "emergency_defense": threatened_owned_value >= EMERGENCY_DEFENSE_CRITICAL_THREAT,
             "threatened_owned_value": threatened_owned_value,
+            "is_finishing": False,
+            "is_opening": False,
         }
+
+
+    def _build_modes(self):
+        modes = dict(self.modes_snapshot)
+        compat_phase = self._compat_phase_label(self.phase_state["current_phase"])
+        modes["phase"] = compat_phase
+        modes["phase_label"] = self.phase_state["current_phase"]
+        modes["is_opening"] = self.phase_state["current_phase"] == PHASE_EXPANSION_RACE
+        modes["is_finishing"] = self.phase_state["current_phase"] == PHASE_FINAL_SCORING or self.step >= 400
+        return modes
 
     def comet_turns_left(self, comet):
         return comet_remaining_life_from_paths(self.comet_path_by_id, comet.id, exclude_current=True)
@@ -852,6 +994,131 @@ class World:
         if my_t > enemy_t + SAFE_NEUTRAL_MARGIN:
             return "enemy_favored", my_t, enemy_t
         return "neutral", my_t, enemy_t
+
+    def compute_phase_signals(self):
+        """Compute and cache normalized strategic phase signals once per turn."""
+        if self._phase_signals_cache is not None:
+            return self._phase_signals_cache
+
+        turn_progress = clamp(self.step / max(1.0, float(EPISODE_STEPS - 1)), 0.0, 1.0)
+        my_prod = float(self.modes.get("my_prod", 0.0))
+        enemy_prod = float(self.modes.get("enemy_prod", 0.0))
+        my_total_ships = float(self.modes.get("my_total", 0.0))
+        enemy_total_ships = float(self.modes.get("enemy_total", 0.0))
+
+        # Neutral value scoring and contest-bucket splits.
+        neutral_total = 0.0
+        neutral_easy = 0.0
+        neutral_contested = 0.0
+        neutral_unsafe = 0.0
+        for target in self.neutral_planets:
+            req = estimate_capture_requirement(self, target)
+            my_t = self.approximate_reaction_time(self.player, target)
+            status, _mt, _et = self.neutral_status(target)
+            eta = max(1.0, float(my_t if my_t < 999 else 45))
+            eta_adjusted_cost = max(1.0, req * (1.0 + 0.028 * eta))
+            production_weight = 9.0 * target.production
+            strategic_weight = self.importance.get(target.id, 1.0)
+            value = (production_weight + strategic_weight) / eta_adjusted_cost
+            neutral_total += value
+            if status == "safe":
+                neutral_easy += value
+            elif status == "contested":
+                neutral_contested += value
+            elif status == "enemy_favored":
+                neutral_unsafe += value
+
+        neutral_norm = neutral_total / (neutral_total + 25.0)
+        neutral_value_remaining = clamp(neutral_norm, 0.0, 1.0)
+        easy_neutral_value_remaining = clamp(neutral_easy / (neutral_total + 1.0), 0.0, 1.0)
+        contested_neutral_value_remaining = clamp(neutral_contested / (neutral_total + 1.0), 0.0, 1.0)
+        unsafe_neutral_value_remaining = clamp(neutral_unsafe / (neutral_total + 1.0), 0.0, 1.0)
+
+        my_production_share_total = clamp(my_prod / max(1.0, my_prod + enemy_prod), 0.0, 1.0)
+        strongest_enemy_prod = max([0.0] + [float(self.enemy_prod_by_owner.get(o, 0.0)) for o in self.enemy_owner_ids])
+        my_production_share_vs_strongest = clamp(my_prod / max(1.0, my_prod + strongest_enemy_prod), 0.0, 1.0)
+        my_ship_share_total = clamp(my_total_ships / max(1.0, my_total_ships + enemy_total_ships), 0.0, 1.0)
+        my_mobile_ship_share_vs_enemies = clamp(
+            float(self.fleet_ships_by_owner.get(self.player, 0.0))
+            / max(1.0, float(self.fleet_ships_by_owner.get(self.player, 0.0)) + float(sum(self.fleet_ships_by_owner.get(o, 0.0) for o in self.enemy_owner_ids))),
+            0.0,
+            1.0,
+        )
+        enemy_ship_pressure = clamp(enemy_total_ships / max(1.0, my_total_ships), 0.0, 2.0)
+
+        # Frontier / contact pressure from nearest cross-front distances.
+        frontier_scores = []
+        for mine in self.my_planets:
+            best = 999.0
+            for enemy in self.enemy_planets:
+                d = dist_xy(mine.x, mine.y, enemy.x, enemy.y) - mine.radius - enemy.radius
+                if d < best:
+                    best = d
+            if best < 999.0:
+                frontier_scores.append(1.0 / max(6.0, best))
+        frontier_contact = clamp(sum(frontier_scores) / max(1.0, len(frontier_scores) * 0.12), 0.0, 1.0)
+
+        threatened_owned_value = 0.0
+        owned_total_value = 0.0
+        enemy_vulnerability = 0.0
+        enemy_total_value = 0.0
+        for p in self.my_planets:
+            v = self.importance.get(p.id, 1.0)
+            owned_total_value += v
+            loss_eta = first_loss_eta(self, p, DEFENSE_HORIZON)
+            if loss_eta is not None:
+                threatened_owned_value += v / max(1.0, loss_eta / 12.0)
+        for p in self.enemy_planets:
+            v = self.importance.get(p.id, 1.0)
+            enemy_total_value += v
+            pressure = float(self.enemy_source_pressure.get(p.id, 0))
+            owner_at, ships_at = self.estimated_owner_after(p, min(18, ATTACK_HORIZON))
+            if pressure > 0.0 or (owner_at == p.owner and ships_at < p.ships * 0.72):
+                enemy_vulnerability += v
+        threatened_owned_value = clamp(threatened_owned_value / max(1.0, owned_total_value), 0.0, 1.0)
+        enemy_vulnerability = clamp(enemy_vulnerability / max(1.0, enemy_total_value), 0.0, 1.0)
+
+        comet_total = 0.0
+        comet_reachable = 0.0
+        for c in self.planets:
+            if c.id not in self.comet_ids:
+                continue
+            left = self.comet_turns_left(c)
+            if left <= 0:
+                continue
+            val = (5.0 * c.production + 0.45 * self.importance.get(c.id, 1.0)) * clamp(left / 40.0, 0.15, 1.0)
+            comet_total += val
+            if self.approximate_reaction_time(self.player, c) <= left:
+                comet_reachable += val
+        comet_window_value = clamp(comet_reachable / max(1.0, comet_total), 0.0, 1.0)
+
+        # Final-phase payback trigger feasibility.
+        turns_left = float(self.turns_remaining())
+        payback_horizon = min(60.0, turns_left)
+        payback_feasibility = clamp(
+            (my_prod * payback_horizon + my_total_ships) / max(1.0, enemy_prod * payback_horizon + enemy_total_ships),
+            0.0,
+            2.0,
+        )
+
+        self._phase_signals_cache = {
+            "turn_progress": turn_progress,
+            "neutral_value_remaining": neutral_value_remaining,
+            "easy_neutral_value_remaining": easy_neutral_value_remaining,
+            "contested_neutral_value_remaining": contested_neutral_value_remaining,
+            "unsafe_neutral_value_remaining": unsafe_neutral_value_remaining,
+            "my_production_share_total": my_production_share_total,
+            "my_production_share_vs_strongest": my_production_share_vs_strongest,
+            "my_ship_share_total": my_ship_share_total,
+            "my_mobile_ship_share_vs_enemies": my_mobile_ship_share_vs_enemies,
+            "enemy_ship_pressure": enemy_ship_pressure,
+            "frontier_contact": frontier_contact,
+            "threatened_owned_value": threatened_owned_value,
+            "enemy_vulnerability": enemy_vulnerability,
+            "comet_window_value": comet_window_value,
+            "payback_feasibility": payback_feasibility,
+        }
+        return self._phase_signals_cache
 
 
 # ============================================================
