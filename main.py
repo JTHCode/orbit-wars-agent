@@ -563,8 +563,20 @@ class World:
             self.arrivals_by_planet[a.planet_id].append(a)
         for pid in self.arrivals_by_planet:
             self.arrivals_by_planet[pid].sort(key=lambda a: a.eta)
+        # Bootstrap available ships for phase-signal synthesis before phase state exists.
+        self.available_ships = {p.id: int(p.ships) for p in self.my_planets}
+        self._initializing_phase_cache = True
 
+        # Bootstrap caches/importance so phase-signal generation can reference them safely.
+        self.reaction_cache = {}
+        self.importance = {}
+        self.phase_signals = self.compute_phase_signals()
+        # Seed phase cache once so initialization-time phase checks do not
+        # repeatedly re-enter state phase computation.
+        self._state_phase_cached, self._state_phase_scores_cached = self._state_driven_phase()
+        self._active_phase_cached = self._state_phase_cached if USE_STATE_DRIVEN_PHASES else self._legacy_turn_phase()
         self.importance = self._planet_importance()
+        # Recompute phase signals now that importance is available to avoid stale values.
         self.phase_signals = self.compute_phase_signals()
         self.phase_overrides = {"emergency_defense": False}
         self._refresh_phase_overrides(self.phase_signals)
@@ -572,7 +584,12 @@ class World:
         # initial mode synthesis.
         self.modes = {"mode_ahead": 0.0, "mode_even": 1.0, "mode_behind": 0.0}
         self.modes = self._build_modes()
-        self.reaction_cache = {}
+        # Recompute with full budgeting once phase/mode state is initialized.
+        self.available_ships = {p.id: projected_ship_budget(self, p) for p in self.my_planets}
+        # Compute phase once per turn and reuse it at all call sites.
+        self._state_phase_cached, self._state_phase_scores_cached = self._state_driven_phase()
+        self._active_phase_cached = self._state_phase_cached if USE_STATE_DRIVEN_PHASES else self._legacy_turn_phase()
+        self._initializing_phase_cache = False
 
     def compute_phase_signals(self):
         """Build phase signals consumed by phase/mode and mission logic."""
@@ -851,8 +868,9 @@ class World:
         }
 
     def phase(self):
-        state_phase, scores = self._state_driven_phase()
-        active_phase = state_phase if USE_STATE_DRIVEN_PHASES else self._legacy_turn_phase()
+        state_phase = self._state_phase_cached
+        scores = self._state_phase_scores_cached
+        active_phase = self._active_phase_cached
         shadow_phase = state_phase if PHASE_SHADOW_MODE else None
         self._log_phase_debug(active_phase, scores, shadow_phase=shadow_phase)
         transition = _RUNTIME.last_phase_transition
@@ -872,6 +890,11 @@ class World:
         return compat.get(active_phase, "mid")
 
     def current_phase(self):
+        if getattr(self, "_initializing_phase_cache", False):
+            return self._legacy_turn_phase()
+        cached = getattr(self, "_active_phase_cached", None)
+        if cached is not None:
+            return cached
         state_phase, _ = self._state_driven_phase()
         return state_phase if USE_STATE_DRIVEN_PHASES else self._legacy_turn_phase()
 
@@ -1014,7 +1037,7 @@ class World:
                 if avail < MIN_LAUNCH:
                     continue
                 probe = int(min(avail, max(MIN_LAUNCH, 10 if target.owner == NEUTRAL_OWNER else 14)))
-                sol = solve_launch_to_planet(self, src, target, probe, max_turns=ATTACK_HORIZON)
+                sol = solve_launch_discrete(self, src, target, probe, max_turns=ATTACK_HORIZON, require_clear=True)
                 if sol is None:
                     continue
                 best = sol.eta if best is None else min(best, sol.eta)
