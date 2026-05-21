@@ -53,7 +53,7 @@ MAX_DEFENSE_SOURCES = 8
 MAX_SWARM_SOURCES = 5
 
 # Phase rollout flags (default conservative path).
-USE_STATE_DRIVEN_PHASES = False
+USE_STATE_DRIVEN_PHASES = True
 PHASE_SHADOW_MODE = False
 LOG_PHASE_TRANSITIONS = False
 
@@ -94,6 +94,8 @@ PHASE_CONFIG = {
         "forced_final_scoring_step": 400,
         "early_enemy_end_step": 130,
         "nearest_danger_opening_end_step": 120,
+        "pressure_enemy_focus_step": 130,
+        "nearest_danger_step_gate_phase": "expansion_race",
         "emergency_override_domination": -0.34,
         "emergency_override_prod_domination": -0.30,
     },
@@ -925,7 +927,10 @@ class World:
         turns_left = max(0, EPISODE_STEPS - self.step)
         typical_eta = max(4, self.typical_attack_eta())
         payoff_window = 9
-        hard_enter = turns_left <= 26
+        guardrails = PHASE_CONFIG.get("guardrails", {})
+        forced_final_step = int(guardrails.get("forced_final_scoring_step", 400))
+        final_entry_step = int(guardrails.get("final_scoring_entry_step", 160))
+        hard_enter = turns_left <= 26 or self.step >= forced_final_step
         if hard_enter:
             prev_state.current_phase = "final_scoring"
             prev_state.hold_turns = 0
@@ -936,16 +941,18 @@ class World:
             signals.normalized.get("neutral_value_remaining", 0.0) < 0.18
             or signals.normalized.get("neutral_value_easy", 0.0) < 0.16
         )
-        low_turn_lock = turns_left <= typical_eta + payoff_window
+        low_turn_lock = self.step >= final_entry_step and turns_left <= typical_eta + payoff_window
         if low_turn_lock and low_payback_confirmation:
             prev_state.current_phase = "final_scoring"
             prev_state.hold_turns = 0
             prev_state.persistence_turns.clear()
             return "final_scoring"
 
-        margin = 0.14
+        margins = PHASE_CONFIG.get("hysteresis_margins", {})
+        hold_cfg = PHASE_CONFIG.get("min_hold_turns", {})
+        margin = float(margins.get("phase_switch", 0.08))
         persistence_required = 2
-        min_hold_turns = 5
+        min_hold_turns = int(hold_cfg.get("phase", 8))
         candidate = max(phase_order, key=lambda p: getattr(scores, p))
         current_score = getattr(scores, current)
         candidate_score = getattr(scores, candidate)
@@ -1951,7 +1958,8 @@ def target_roi_score(world, target, required, eta, source_dist, planned_arrivals
 
     # V7: opening/midgame nearest-owner danger heuristic from the article.
     nearest_mult = 1.0
-    if target.owner == NEUTRAL_OWNER and world.step < NEAREST_DANGER_OPENING_END:
+    nearest_danger_phase = PHASE_CONFIG["guardrails"].get("nearest_danger_step_gate_phase", "expansion_race")
+    if target.owner == NEUTRAL_OWNER and world.is_phase(nearest_danger_phase):
         nearest_mult = nearest_owner_danger_mult(world, target, min(75, max(12, eta)), NEAREST_DANGER_K)
 
     # V7: approximate post-capture retake risk. Estimate capture surplus from the
@@ -2275,7 +2283,7 @@ class Planner:
     def build_pressure_opportunity_missions(self):
         """Targeted non-final enemy pressure without globally lowering all attack thresholds."""
         out = []
-        if self.w.step >= EARLY_ENEMY_END or self.w.is_phase("final_scoring") or not self.w.enemy_planets:
+        if self.w.is_phase("final_scoring") or not self.w.enemy_planets:
             return out
 
         targets = sorted(
@@ -2502,7 +2510,8 @@ class Planner:
             launched = self.w.enemy_source_pressure.get(target.id, 0)
             if launched > 0:
                 value *= 1.0 + min(0.22, launched / max(45.0, target.ships + launched))
-            if self.w.step < EARLY_ENEMY_END and target.ships <= 28 + 4 * target.production:
+            pressure_enemy_focus_step = PHASE_CONFIG["guardrails"].get("pressure_enemy_focus_step", EARLY_ENEMY_END)
+            if (not self.w.phase_at_least("conversion_pressure")) and self.w.step < pressure_enemy_focus_step and target.ships <= 28 + 4 * target.production:
                 value *= 1.18
             if self.w.enemy_planet_count_by_owner.get(target.owner, 0) <= 2:
                 value *= 1.10

@@ -23,6 +23,13 @@ This changelog is maintained by agents working in this repository.
 ---
 
 
+## 2026-05-21 — Activate state-driven phases by default and de-hardcode policy gates
+
+- Summary: Enabled state-driven phases by default, wired `choose_phase()` hysteresis/guardrail values to `PHASE_CONFIG`, and replaced remaining step-only phase gates with phase-aware checks (including nearest-danger and pressure-opportunity gating).
+- Why: Complete the transition from legacy turn buckets to the state-driven phase system and prevent config drift from hardcoded duplicate thresholds.
+- Impact: Active runtime phase policy now follows state signals/hysteresis by default; phase tuning is now centralized in `PHASE_CONFIG` and less brittle across modules.
+- Files: `orbit_agent/core.py`, `main.py`, `agents.md`, `changelog.md`
+
 ## 2026-05-21 — Sync phase-policy docs and benchmark comparison guidance
 
 - Summary: Updated project docs to explicitly reference the new state-driven phase pipeline (`compute_phase_signals` → `compute_phase_scores` → `choose_phase`), hysteresis/override hooks, and rollout flag ownership; added benchmark guidance for controlled old-vs-new phase-policy comparisons.
