@@ -56,14 +56,6 @@ MAX_SWARM_SOURCES = 5
 OPENING_END = 60
 MID_END = 110
 PRESSURE_END = 160
-PHASE_SWITCH_MARGIN_DEFAULT = 0.07
-PHASE_SWITCH_STREAK_DEFAULT = 2
-ENDGAME_MIN_TURNS_REMAINING = 55
-ENDGAME_MIN_DOMINATION = -0.12
-ENDGAME_MIN_PROD_DOMINATION = -0.15
-EXPANSION_LOW_VALUE_THRESHOLD = 0.85
-EXPANSION_HIGH_PRESSURE_THRESHOLD = 0.62
-EMERGENCY_DEFENSE_CRITICAL_THREAT = 0.78
 SAFE_NEUTRAL_MARGIN = 2
 CONTESTED_NEUTRAL_MARGIN = 4
 HOSTILE_SWARM_TOL = 2
@@ -118,14 +110,6 @@ COMET_EVAC_WINDOW = 18
 COMET_EVAC_MIN_SEND = 4
 COMET_EVAC_KEEP = 1
 COMET_EVAC_ATTACK_BONUS = 1.20
-
-# Final-phase evaluator knobs.
-FINAL_TURN_SAFETY_PRIOR = 430
-FINAL_ETA_SAMPLE_CAP = 16
-FINAL_HIGH_VALUE_TOP_K = 6
-FINAL_PAYBACK_WINDOW_PAD = 10
-FINAL_PRESERVATION_MARGIN = -0.18
-FINAL_SWING_RISK_ALERT = 0.55
 
 # Timing debug. Keep False for submissions.
 DEBUG_TIMING_PRINTS = False
@@ -204,8 +188,6 @@ class RuntimeStats:
         self.max_t = 0.0
         self.last = 0.0
         self.last_error = None
-        self.phase_hysteresis = {}
-        self.last_phase_transition = None
 
     def record(self, elapsed):
         self.turns += 1
@@ -217,25 +199,6 @@ class RuntimeStats:
         if elapsed > self.max_t:
             self.max_t = elapsed
 
-
-
-    def record_phase(self, game_turn, phase_diag):
-        self.phase_diag = dict(phase_diag or {})
-        self.phase_diag["game_turn"] = int(game_turn)
-
-        phase = self.phase_diag.get("current_phase")
-        prev = self.phase_diag.get("previous_phase")
-        if phase and prev and phase != prev:
-            event = {
-                "turn": int(game_turn),
-                "from": prev,
-                "to": phase,
-                "reason_bits": list(self.phase_diag.get("transition_reason_bits", [])),
-            }
-            self.phase_transitions.append(event)
-            if len(self.phase_transitions) > 128:
-                self.phase_transitions = self.phase_transitions[-128:]
-
     def as_dict(self):
         return {
             "global_turns": self.turns,
@@ -245,9 +208,6 @@ class RuntimeStats:
             "max_turn_time": round(self.max_t, 5),
             "last_turn_time": round(self.last, 5),
             "last_error": self.last_error,
-            "phase_diagnostics": self.phase_diag,
-            "phase_transitions": list(self.phase_transitions[-16:]),
-            "last_phase_transition": self.last_phase_transition,
         }
 
 
@@ -531,11 +491,9 @@ class World:
         for pid in self.arrivals_by_planet:
             self.arrivals_by_planet[pid].sort(key=lambda a: a.eta)
 
-        self.reaction_cache = {}
         self.importance = self._planet_importance()
         self.modes = self._build_modes()
         self.reaction_cache = {}
-        self._phase_cache = None
 
     def _parse_comet_paths(self, comet_groups):
         for group in comet_groups:
@@ -625,210 +583,17 @@ class World:
         self._future_xy_cache[key] = ans
         return ans
 
-    def phase_scores(self):
-        progress = self.step / max(1.0, float(EPISODE_STEPS))
-        my_total = sum(p.ships for p in self.my_planets) + sum(f.ships for f in self.fleets if f.owner == self.player)
-        enemy_total = sum(p.ships for p in self.enemy_planets) + sum(f.ships for f in self.fleets if f.owner != self.player)
-        my_prod = sum(p.production for p in self.my_planets)
-        enemy_prod = sum(p.production for p in self.enemy_planets)
-
-        norm_ship_delta = (my_total - enemy_total) / max(1.0, my_total + enemy_total)
-        norm_prod_delta = (my_prod - enemy_prod) / max(1.0, my_prod + enemy_prod)
-        enemy_pressure = min(1.0, len(self.enemy_planets) / max(1.0, len(self.planets)))
-
-        signals = {
-            "progress": progress,
-            "ship_delta": norm_ship_delta,
-            "prod_delta": norm_prod_delta,
-            "enemy_pressure": enemy_pressure,
-        }
-        scores = {
-            "opening": (1.0 - progress) * 1.35 - enemy_pressure * 0.25,
-            "mid": 1.15 - abs(progress - 0.35) * 2.1 + (1.0 - abs(norm_prod_delta)) * 0.10,
-            "pressure": 0.95 - abs(progress - 0.62) * 2.0 + (-norm_ship_delta) * 0.35 + enemy_pressure * 0.20,
-            "endgame": progress * 1.45 + norm_ship_delta * 0.25,
-        }
-        return scores, signals
-
     def phase(self):
-        return self.select_phase_with_hysteresis()
-
-    def _phase_scores(self):
-        step_opening = 1.0 - min(1.0, self.step / max(1.0, float(OPENING_END)))
-        step_endgame = 1.0 if self.step >= PRESSURE_END else max(0.0, (self.step - MID_END) / max(1.0, float(PRESSURE_END - MID_END)))
-        enemy_prod = sum(p.production for p in self.enemy_planets)
-        my_prod = sum(p.production for p in self.my_planets)
-        my_total = sum(p.ships for p in self.my_planets) + sum(f.ships for f in self.fleets if f.owner == self.player)
-        enemy_total = sum(p.ships for p in self.enemy_planets) + sum(f.ships for f in self.fleets if f.owner != self.player)
-        dom = (my_total - enemy_total) / max(1.0, my_total + enemy_total)
-        prod_dom = (my_prod - enemy_prod) / max(1.0, my_prod + enemy_prod)
-        easy_neutral_value = 0.0
-        for p in self.neutral_planets:
-            my_t = self.approximate_reaction_time(self.player, p)
-            enemy_t = min([self.approximate_reaction_time(owner, p) for owner in self.enemy_owner_ids] or [999])
-            if my_t <= enemy_t + 1 and my_t < 999:
-                easy_neutral_value += p.production / max(1.0, my_t)
-        enemy_frontier_pressure = 0.0
-        for e in self.enemy_planets:
-            best = min((dist_xy(e.x, e.y, m.x, m.y) for m in self.my_planets), default=99.0)
-            enemy_frontier_pressure += e.production / max(10.0, best)
-        threatened_owned_value = 0.0
-        for m in self.my_planets:
-            risk = estimate_threat_score(self, m)
-            threatened_owned_value += self.importance.get(m.id, 1.0) * risk
-        total_owned_importance = max(1.0, sum(self.importance.get(m.id, 1.0) for m in self.my_planets))
-        threatened_owned_value = threatened_owned_value / total_owned_importance
-        scores = {
-            "opening": 1.3 * step_opening + 0.25 * max(0.0, easy_neutral_value - 0.8),
-            "mid": 0.75 + 0.25 * (1.0 - abs(dom)),
-            "pressure": 0.35 + 0.75 * max(0.0, enemy_frontier_pressure - 0.3),
-            "endgame": 0.35 + 0.45 * step_endgame + 0.35 * max(0.0, dom),
-            "easy_neutral_value": easy_neutral_value,
-            "enemy_frontier_pressure": enemy_frontier_pressure,
-            "threatened_owned_value": threatened_owned_value,
-            "domination": dom,
-            "prod_domination": prod_dom,
-        }
-        return scores
-
-    def select_phase_with_hysteresis(self):
-        phase_order = ("opening", "mid", "pressure", "endgame")
-        scores = self._phase_scores()
-        phase_scores = {k: scores[k] for k in phase_order}
-        candidate = max(phase_order, key=lambda p: phase_scores[p])
-        game_key = _RUNTIME.game_key
-        state = _RUNTIME.phase_hysteresis.setdefault(game_key, {"phase": "opening", "streak_phase": None, "streak": 0})
-        prev_phase = state.get("phase", "opening")
-        current_score = phase_scores.get(prev_phase, 0.0)
-        candidate_score = phase_scores[candidate]
-        margin = PHASE_SWITCH_MARGIN_DEFAULT
-        margin_pass = (candidate != prev_phase) and (candidate_score - current_score >= margin)
-
-        streak_cfg = {("opening", "mid"): 2, ("mid", "pressure"): 2, ("pressure", "endgame"): 3}
-        needed_streak = streak_cfg.get((prev_phase, candidate), PHASE_SWITCH_STREAK_DEFAULT)
-        if candidate == state.get("streak_phase"):
-            state["streak"] = int(state.get("streak", 0)) + 1
-        else:
-            state["streak_phase"] = candidate
-            state["streak"] = 1
-        persistence_pass = state["streak"] >= needed_streak
-
-        turns_remaining = self.turns_remaining()
-        endgame_guardrail = True
-        if candidate == "endgame":
-            endgame_guardrail = (
-                turns_remaining <= ENDGAME_MIN_TURNS_REMAINING
-                or scores["domination"] >= ENDGAME_MIN_DOMINATION
-                or scores["prod_domination"] >= ENDGAME_MIN_PROD_DOMINATION
-            )
-        expansion_guardrail = not (
-            prev_phase == "pressure"
-            and candidate == "pressure"
-            and scores["easy_neutral_value"] < EXPANSION_LOW_VALUE_THRESHOLD
-            and scores["enemy_frontier_pressure"] > EXPANSION_HIGH_PRESSURE_THRESHOLD
-        )
-
-        should_switch = margin_pass and persistence_pass and endgame_guardrail and expansion_guardrail
-        new_phase = candidate if should_switch else prev_phase
-        state["phase"] = new_phase
-
-        _RUNTIME.last_phase_transition = {
-            "turn": int(self.step),
-            "prev_phase": prev_phase,
-            "new_phase": new_phase,
-            "candidate_phase": candidate,
-            "scores": {k: round(v, 4) for k, v in phase_scores.items()},
-            "score_delta": round(candidate_score - current_score, 4),
-            "margin_pass": bool(margin_pass),
-            "persistence_pass": bool(persistence_pass),
-            "endgame_guardrail": bool(endgame_guardrail),
-            "expansion_guardrail": bool(expansion_guardrail),
-            "needed_streak": int(needed_streak),
-            "streak": int(state.get("streak", 0)),
-            "turns_remaining": int(turns_remaining),
-            "threatened_owned_value": round(scores["threatened_owned_value"], 4),
-        }
-        return new_phase
+        if self.step < OPENING_END:
+            return "opening"
+        if self.step < MID_END:
+            return "mid"
+        if self.step < PRESSURE_END:
+            return "pressure"
+        return "endgame"
 
     def turns_remaining(self):
         return max(0, EPISODE_STEPS - self.step)
-
-    def _high_value_targets(self, top_k=FINAL_HIGH_VALUE_TOP_K):
-        ranked = [p for p in self.planets if p.owner != self.player]
-        ranked.sort(key=lambda p: self.importance.get(p.id, 1.0), reverse=True)
-        return ranked[:top_k]
-
-    def _typical_attack_eta(self, targets):
-        etas = []
-        if not targets:
-            return {"samples": [], "median": 999, "p75": 999, "min": 999, "max": 999}
-        for src in sorted(self.my_planets, key=lambda p: p.ships, reverse=True)[:FINAL_ETA_SAMPLE_CAP]:
-            if src.ships < MIN_LAUNCH:
-                continue
-            probe = max(MIN_LAUNCH, min(18, int(src.ships)))
-            for tgt in targets:
-                eta = approximate_eta_between_planets(self, src, tgt, 0, probe)
-                if eta < 999:
-                    etas.append(int(eta))
-        if not etas:
-            return {"samples": [], "median": 999, "p75": 999, "min": 999, "max": 999}
-        etas.sort()
-        n = len(etas)
-        return {
-            "samples": etas,
-            "median": etas[n // 2],
-            "p75": etas[min(n - 1, int(0.75 * (n - 1)))],
-            "min": etas[0],
-            "max": etas[-1],
-        }
-
-    def _late_swing_risk(self, targets, eta_hint):
-        if not targets or not self.enemy_planets:
-            return 0.0
-        horizon = max(6, min(60, int(eta_hint + 6)))
-        risky = 0
-        total = 0
-        for tgt in targets:
-            total += 1
-            for enemy in self.enemy_planets:
-                if enemy.ships < MIN_LAUNCH:
-                    continue
-                eta = approximate_eta_between_planets(self, enemy, tgt, 0, max(MIN_LAUNCH, min(18, int(enemy.ships))))
-                if eta <= horizon:
-                    risky += 1
-                    break
-        return risky / max(1, total)
-
-    def _build_final_evaluator(self):
-        turns_left = self.turns_remaining()
-        targets = self._high_value_targets()
-        eta_dist = self._typical_attack_eta(targets)
-        eta_env = eta_dist["p75"] if eta_dist["p75"] < 999 else eta_dist["median"]
-        payback_scores = []
-        for t in targets:
-            req = int(max(1, t.ships + 1))
-            prod = discounted_production_value(self, t, max(1, eta_dist["median"] if eta_dist["median"] < 999 else 8), PV_GAMMA)
-            denom = max(1.0, req)
-            risk = 1.0
-            if t.owner not in (self.player, NEUTRAL_OWNER):
-                risk += min(0.75, self.enemy_source_pressure.get(t.id, 0) / max(12.0, t.ships + 1.0))
-            payback_scores.append((prod / denom) - 0.30 * risk)
-        capture_payback_score = (sum(payback_scores) / len(payback_scores)) if payback_scores else -1.0
-        late_swing_risk = self._late_swing_risk(targets, eta_env if eta_env < 999 else 20)
-        envelope = max(6, int((eta_env if eta_env < 999 else 14) + FINAL_PAYBACK_WINDOW_PAD))
-        final_scoring = (
-            turns_left <= envelope
-            or (capture_payback_score <= FINAL_PRESERVATION_MARGIN and late_swing_risk >= FINAL_SWING_RISK_ALERT)
-            or self.step >= FINAL_TURN_SAFETY_PRIOR
-        )
-        return {
-            "typical_attack_eta": eta_dist,
-            "turns_remaining": turns_left,
-            "capture_payback_score": capture_payback_score,
-            "late_swing_risk": late_swing_risk,
-            "eta_payoff_envelope": envelope,
-            "final_scoring": final_scoring,
-        }
 
     def _estimate_arrivals(self):
         arrivals = []
@@ -902,8 +667,6 @@ class World:
         domination = (my_total - enemy_total) / total
         prod_domination = (my_prod - enemy_prod) / max(1.0, my_prod + enemy_prod)
         phase = self.phase()
-        final_eval = self._build_final_evaluator()
-        threatened_owned_value = self._phase_scores()["threatened_owned_value"]
         return {
             "phase": phase,
             "my_total": my_total,
@@ -915,11 +678,8 @@ class World:
             "is_behind": domination < -0.18 or prod_domination < -0.18,
             "is_ahead": domination > 0.16 or prod_domination > 0.16,
             "is_dominating": domination > 0.34 or prod_domination > 0.30,
-            "is_finishing": final_eval["final_scoring"],
-            "final_eval": final_eval,
+            "is_finishing": phase == "endgame" or self.step >= 400,
             "is_opening": phase == "opening",
-            "emergency_defense": threatened_owned_value >= EMERGENCY_DEFENSE_CRITICAL_THREAT,
-            "threatened_owned_value": threatened_owned_value,
         }
 
     def comet_turns_left(self, comet):
@@ -1569,7 +1329,7 @@ def post_capture_retake_risk(world, target, capture_eta, surplus_after_capture, 
     This is intentionally approximate: it should price risk and add margin, not replace
     exact combat/launch solving. Known incoming fleets are still handled by simulate_planet.
     """
-    if not world.enemy_planets or world.modes["is_finishing"]:
+    if not world.enemy_planets or world.phase() == "endgame":
         return {"risk": 0.0, "extra_margin": 0, "fastest_delay": 999, "enemy_power": 0.0}
 
     capture_eta = int(max(1, math.ceil(capture_eta)))
@@ -1677,7 +1437,7 @@ def target_extra_margin(world, target, eta):
     elif world.modes["is_dominating"]:
         margin = int(margin * 1.15) + 1
 
-    if world.modes["is_finishing"]:
+    if world.phase() == "endgame":
         margin = max(1, int(margin * 0.45))
     if target.id in world.comet_ids:
         margin = min(margin, 2)
@@ -1751,7 +1511,7 @@ def target_roi_score(world, target, required, eta, source_dist, planned_arrivals
     # V7: approximate post-capture retake risk. Estimate capture surplus from the
     # proposed send amount, then discount/reject fragile captures near enemy sources.
     retake = {"risk": 0.0, "extra_margin": 0}
-    if not world.modes["is_finishing"]:
+    if world.phase() != "endgame":
         owner_at_eta, ships_at_eta, _ = simulate_planet(world, target, eta, planned_arrivals=planned_arrivals)
         if owner_at_eta != world.player:
             surplus_est = max(0.0, float(required) - max(0.0, ships_at_eta))
@@ -1811,7 +1571,7 @@ def target_roi_score(world, target, required, eta, source_dist, planned_arrivals
             score *= 1.32
         else:
             score *= 0.88
-    elif world.modes["is_finishing"]:
+    elif world.phase() == "endgame":
         if eta > world.turns_remaining() - 3:
             return -1e9
         score *= 0.70 if target.owner == NEUTRAL_OWNER else 1.15
@@ -2435,7 +2195,7 @@ class Planner:
                 return None
         required_final = target_required_ships(self.w, target, best.eta, self.planned_arrivals)
         required_final = int(math.ceil(required_final + extra_margin))
-        if not self.w.modes["is_finishing"]:
+        if self.w.phase() != "endgame":
             owner_at_eta, ships_at_eta, _ = simulate_planet(self.w, target, best.eta, planned_arrivals=self.planned_arrivals)
             surplus_est = max(0.0, float(required_final) - max(0.0, ships_at_eta if owner_at_eta != self.w.player else 0.0))
             retake = post_capture_retake_risk(self.w, target, best.eta, surplus_est, self.planned_arrivals)
@@ -2522,7 +2282,7 @@ class Planner:
         extra = [Arrival(target.id, self.w.player, int(p.ships), int(p.eta)) for p in plans]
         capture_eta = max(p.eta for p in plans)
 
-        if self.w.modes["is_finishing"]:
+        if self.w.phase() == "endgame":
             horizon = min(self.w.turns_remaining(), capture_eta + 3)
         else:
             hold_window = 10 if target.owner == NEUTRAL_OWNER else 14
@@ -2547,7 +2307,7 @@ class Planner:
 
         # V7: if the target looks captured under known arrivals, also check whether
         # nearby enemy planets can cheaply retake it after capture.
-        if not self.w.modes["is_finishing"]:
+        if self.w.phase() != "endgame":
             owner_at_cap, ships_at_cap, _ = simulate_planet(
                 self.w,
                 target,
@@ -2566,7 +2326,7 @@ class Planner:
                 if surplus_at_capture < retake["extra_margin"] + max(1, target.production):
                     return False
 
-        if not self.w.modes["is_finishing"] and target.owner != NEUTRAL_OWNER:
+        if self.w.phase() != "endgame" and target.owner != NEUTRAL_OWNER:
             return ships >= max(1, int(0.8 * target.production))
         return ships >= 0
 
@@ -3047,7 +2807,7 @@ class Planner:
         """Chain safe rear surplus into planets that can launch important future attacks."""
         if len(self.moves) >= MAX_MOVES - 1:
             return
-        if self.w.modes["is_finishing"] or self.w.step < 34 or len(self.w.my_planets) < 3:
+        if self.w.phase() == "endgame" or self.w.step < 34 or len(self.w.my_planets) < 3:
             return
         if not self.w.targets:
             return
@@ -3133,7 +2893,7 @@ class Planner:
         """Move rear surplus into planets that have a concrete future attack demand."""
         if len(self.moves) >= MAX_MOVES - 1:
             return
-        if self.w.modes["is_finishing"] or self.w.step < 38 or len(self.w.my_planets) < 3:
+        if self.w.phase() == "endgame" or self.w.step < 38 or len(self.w.my_planets) < 3:
             return
         if not self.w.targets:
             return
@@ -3197,7 +2957,7 @@ class Planner:
     def logistics_funnel(self):
         if len(self.moves) >= MAX_MOVES - 1:
             return
-        if self.w.phase() == "opening" or self.w.modes["is_finishing"] or len(self.w.my_planets) < 4:
+        if self.w.phase() in ("opening", "endgame") or len(self.w.my_planets) < 4:
             return
 
         frontier = self.w.enemy_planets if self.w.enemy_planets else self.w.neutral_planets
