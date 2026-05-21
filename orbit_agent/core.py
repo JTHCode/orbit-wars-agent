@@ -565,11 +565,16 @@ class World:
             self.arrivals_by_planet[pid].sort(key=lambda a: a.eta)
         # Bootstrap available ships for phase-signal synthesis before phase state exists.
         self.available_ships = {p.id: int(p.ships) for p in self.my_planets}
+        self._initializing_phase_cache = True
 
         # Bootstrap caches/importance so phase-signal generation can reference them safely.
         self.reaction_cache = {}
         self.importance = {}
         self.phase_signals = self.compute_phase_signals()
+        # Seed phase cache once so initialization-time phase checks do not
+        # repeatedly re-enter state phase computation.
+        self._state_phase_cached, self._state_phase_scores_cached = self._state_driven_phase()
+        self._active_phase_cached = self._state_phase_cached if USE_STATE_DRIVEN_PHASES else self._legacy_turn_phase()
         self.importance = self._planet_importance()
         # Recompute phase signals now that importance is available to avoid stale values.
         self.phase_signals = self.compute_phase_signals()
@@ -584,6 +589,7 @@ class World:
         # Compute phase once per turn and reuse it at all call sites.
         self._state_phase_cached, self._state_phase_scores_cached = self._state_driven_phase()
         self._active_phase_cached = self._state_phase_cached if USE_STATE_DRIVEN_PHASES else self._legacy_turn_phase()
+        self._initializing_phase_cache = False
 
     def compute_phase_signals(self):
         """Build phase signals consumed by phase/mode and mission logic."""
@@ -884,6 +890,8 @@ class World:
         return compat.get(active_phase, "mid")
 
     def current_phase(self):
+        if getattr(self, "_initializing_phase_cache", False):
+            return self._legacy_turn_phase()
         cached = getattr(self, "_active_phase_cached", None)
         if cached is not None:
             return cached
