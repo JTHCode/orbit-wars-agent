@@ -252,6 +252,7 @@ class RuntimeStats:
         self.max_t = 0.0
         self.last = 0.0
         self.last_error = None
+        self.phase_state = PhaseState()
 
     def record(self, elapsed):
         self.turns += 1
@@ -557,6 +558,8 @@ class World:
 
         self.importance = self._planet_importance()
         self.phase_signals = self.compute_phase_signals()
+        self.phase_overrides = {"emergency_defense": False}
+        self._refresh_phase_overrides(self.phase_signals)
         self.modes = self._build_modes()
         self.reaction_cache = {}
 
@@ -725,6 +728,7 @@ class World:
         if _RUNTIME.game_key != key or (reset_like and _RUNTIME.game_turn > 20):
             _RUNTIME.game_key = key
             _RUNTIME.game_turn = 0
+            _RUNTIME.phase_state = PhaseState()
         return int(_RUNTIME.game_turn)
 
     def is_comet(self, p):
@@ -775,13 +779,93 @@ class World:
         return ans
 
     def phase(self):
-        if self.step < OPENING_END:
-            return "opening"
-        if self.step < MID_END:
-            return "mid"
-        if self.step < PRESSURE_END:
-            return "pressure"
-        return "endgame"
+        scores = self.compute_phase_scores(self.phase_signals)
+        next_phase = self.choose_phase(_RUNTIME.phase_state, scores, self.phase_signals)
+        # Backward-compatibility map for modules that still use legacy names.
+        compat = {
+            "expansion_race": "opening",
+            "border_contest": "mid",
+            "conversion_pressure": "pressure",
+            "final_scoring": "endgame",
+        }
+        return compat.get(next_phase, "mid")
+
+    def compute_phase_scores(self, signals):
+        n = signals.normalized
+        scores = PhaseScores()
+        scores.expansion_race = (
+            1.35 * n["neutral_value_remaining"]
+            + 0.55 * n["neutral_value_easy"]
+            + 0.25 * n["turns_remaining"]
+            - 0.95 * n["turn_progress"]
+            - 0.45 * n["frontier_contact_closest_eta"]
+        )
+        scores.border_contest = (
+            0.95 * n["frontier_contact_closest_eta"]
+            + 0.70 * n["neutral_value_contested"]
+            + 0.55 * n["frontier_contact_my_exposure"]
+            + 0.30 * (1.0 - n["turn_progress"])
+        )
+        scores.conversion_pressure = (
+            1.05 * n["enemy_vulnerability"]
+            + 0.45 * n["my_ship_share_mobile"]
+            + 0.40 * n["frontier_contact_enemy_exposure"]
+            + 0.25 * n["turn_progress"]
+            - 0.35 * n["threatened_owned_value"]
+        )
+        scores.final_scoring = (
+            1.70 * n["turn_progress"]
+            + 1.10 * (1.0 - n["turns_remaining"])
+            + 0.55 * n["my_production_share_total"]
+            + 0.45 * n["my_ship_share_total"]
+            + 0.40 * n["comet_window_value"]
+        )
+        return scores
+
+    def choose_phase(self, prev_state, scores, signals):
+        phase_order = ("expansion_race", "border_contest", "conversion_pressure", "final_scoring")
+        current = prev_state.current_phase if prev_state.current_phase in phase_order else "expansion_race"
+
+        turns_left = max(0, EPISODE_STEPS - self.step)
+        low_turn_lock = turns_left <= 38 or (
+            signals.raw.get("frontier_contact_closest_eta", 999.0) >= max(8.0, turns_left * 0.85)
+            and turns_left <= 56
+        )
+        if low_turn_lock:
+            prev_state.current_phase = "final_scoring"
+            prev_state.hold_turns = 0
+            prev_state.persistence_turns.clear()
+            return "final_scoring"
+
+        margin = 0.14
+        persistence_required = 2
+        min_hold_turns = 5
+        candidate = max(phase_order, key=lambda p: getattr(scores, p))
+        current_score = getattr(scores, current)
+        candidate_score = getattr(scores, candidate)
+
+        prev_state.hold_turns = max(0, prev_state.hold_turns) + 1
+        if candidate != current and candidate_score > current_score + margin and prev_state.hold_turns >= min_hold_turns:
+            sustained = int(prev_state.persistence_turns.get(candidate, 0)) + 1
+            prev_state.persistence_turns[candidate] = sustained
+            if sustained >= persistence_required:
+                prev_state.current_phase = candidate
+                prev_state.confidence = candidate_score - current_score
+                prev_state.hold_turns = 0
+                prev_state.persistence_turns.clear()
+                return candidate
+        else:
+            prev_state.persistence_turns = {k: v for k, v in prev_state.persistence_turns.items() if k == candidate}
+            if candidate == current:
+                prev_state.persistence_turns.clear()
+
+        prev_state.confidence = max(0.0, candidate_score - current_score)
+        return prev_state.current_phase
+
+    def _refresh_phase_overrides(self, signals):
+        emergency_threshold = 0.44
+        threatened_value = signals.normalized.get("threatened_owned_value", 0.0)
+        self.phase_overrides["emergency_defense"] = threatened_value >= emergency_threshold
 
     def turns_remaining(self):
         return max(0, EPISODE_STEPS - self.step)
@@ -860,6 +944,7 @@ class World:
         phase = self.phase()
         return {
             "phase": phase,
+            "emergency_defense": self.phase_overrides.get("emergency_defense", False),
             "my_total": my_total,
             "enemy_total": enemy_total,
             "my_prod": my_prod,

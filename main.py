@@ -52,10 +52,51 @@ MAX_ATTACK_SOURCES = 7
 MAX_DEFENSE_SOURCES = 8
 MAX_SWARM_SOURCES = 5
 
-# Strategy knobs.
-OPENING_END = 60
-MID_END = 110
-PRESSURE_END = 160
+# Phase subsystem configuration.
+PHASE_CONFIG = {
+    "canonical_order": (
+        "expansion_race",
+        "border_contest",
+        "conversion_pressure",
+        "final_scoring",
+    ),
+    "score_weights": {
+        "expansion_race": {"step_progress": -0.60, "neutral_pressure": 1.00, "enemy_pressure": -0.35},
+        "border_contest": {"step_progress": -0.15, "neutral_pressure": 0.65, "enemy_pressure": 0.55},
+        "conversion_pressure": {"step_progress": 0.20, "neutral_pressure": 0.15, "enemy_pressure": 1.00},
+        "final_scoring": {"step_progress": 1.00, "neutral_pressure": -0.30, "enemy_pressure": 0.40},
+    },
+    "phase_turn_bounds": {
+        "expansion_race_end": 60,
+        "border_contest_end": 110,
+        "conversion_pressure_end": 160,
+    },
+    "hysteresis_margins": {
+        "phase_switch": 0.08,
+        "mode_switch": 0.06,
+    },
+    "min_hold_turns": {
+        "phase": 8,
+        "mode": 6,
+    },
+    "persistence_turn_thresholds": {
+        "ahead": 10,
+        "even": 7,
+        "behind": 10,
+    },
+    "guardrails": {
+        "final_scoring_entry_step": 160,
+        "forced_final_scoring_step": 400,
+        "early_enemy_end_step": 130,
+        "nearest_danger_opening_end_step": 120,
+        "emergency_override_domination": -0.34,
+        "emergency_override_prod_domination": -0.30,
+    },
+}
+
+OPENING_END = PHASE_CONFIG["phase_turn_bounds"]["expansion_race_end"]
+MID_END = PHASE_CONFIG["phase_turn_bounds"]["border_contest_end"]
+PRESSURE_END = PHASE_CONFIG["phase_turn_bounds"]["conversion_pressure_end"]
 SAFE_NEUTRAL_MARGIN = 2
 CONTESTED_NEUTRAL_MARGIN = 4
 HOSTILE_SWARM_TOL = 2
@@ -65,7 +106,7 @@ LOGISTICS_MIN_SEND = 9
 SALVAGE_MIN_SEND = 8
 
 # Aggression / logistics extension knobs.
-EARLY_ENEMY_END = 130
+EARLY_ENEMY_END = PHASE_CONFIG["guardrails"]["early_enemy_end_step"]
 EARLY_ENEMY_MAX_ETA = 24
 EARLY_ENEMY_MAX_BUDGET_FRAC = 0.58
 FRONTLINE_STAGING_MIN_SEND = 10
@@ -79,7 +120,7 @@ PV_COMET_MIN_LIFE_AFTER_CAPTURE = 8
 
 # V7 nearest-neighbor danger heuristic knobs.
 NEAREST_DANGER_K = 3
-NEAREST_DANGER_OPENING_END = 120
+NEAREST_DANGER_OPENING_END = PHASE_CONFIG["guardrails"]["nearest_danger_opening_end_step"]
 NEAREST_DANGER_MIN_MULT = 0.62
 NEAREST_DANGER_MAX_MULT = 1.18
 
@@ -178,6 +219,29 @@ class Mission:
     note: str = ""
 
 
+@dataclass
+class PhaseSignals:
+    raw: dict = field(default_factory=dict)
+    normalized: dict = field(default_factory=dict)
+
+
+@dataclass
+class PhaseScores:
+    expansion_race: float = 0.0
+    border_contest: float = 0.0
+    conversion_pressure: float = 0.0
+    final_scoring: float = 0.0
+
+
+@dataclass
+class PhaseState:
+    current_phase: str = "expansion_race"
+    confidence: float = 0.0
+    hold_turns: int = 0
+    persistence_turns: dict = field(default_factory=dict)
+    mode: str = "even"
+
+
 class RuntimeStats:
     def __init__(self):
         self.turns = 0
@@ -188,6 +252,7 @@ class RuntimeStats:
         self.max_t = 0.0
         self.last = 0.0
         self.last_error = None
+        self.phase_state = PhaseState()
 
     def record(self, elapsed):
         self.turns += 1
@@ -492,8 +557,137 @@ class World:
             self.arrivals_by_planet[pid].sort(key=lambda a: a.eta)
 
         self.importance = self._planet_importance()
+        self.phase_signals = self.compute_phase_signals()
+        self.phase_overrides = {"emergency_defense": False}
+        self._refresh_phase_overrides(self.phase_signals)
         self.modes = self._build_modes()
         self.reaction_cache = {}
+
+    def compute_phase_signals(self):
+        """Build phase signals consumed by phase/mode and mission logic."""
+        turn_progress = 0.0 if EPISODE_STEPS <= 0 else clamp(self.step / float(EPISODE_STEPS), 0.0, 1.0)
+        turns_remaining = max(0.0, float(EPISODE_STEPS - self.step))
+
+        neutral_total_value = 0.0
+        neutral_easy = 0.0
+        neutral_contested = 0.0
+        neutral_unsafe = 0.0
+        for p in self.neutral_planets:
+            status, my_t, enemy_t = self.neutral_status(p)
+            eta = max(1.0, float(min(my_t, enemy_t if enemy_t < 999 else my_t)))
+            metric = float(p.production) / max(1.0, float(p.ships)) / eta
+            neutral_total_value += metric
+            if status == "safe":
+                neutral_easy += metric
+            elif status == "contested":
+                neutral_contested += metric
+            else:
+                neutral_unsafe += metric
+
+        my_prod = float(sum(p.production for p in self.my_planets))
+        enemy_prod_by_owner = defaultdict(float)
+        for p in self.enemy_planets:
+            enemy_prod_by_owner[p.owner] += float(p.production)
+        strongest_enemy_prod = max(enemy_prod_by_owner.values(), default=0.0)
+        total_owned_prod = my_prod + sum(enemy_prod_by_owner.values())
+
+        my_planet_ships = float(sum(p.ships for p in self.my_planets))
+        my_fleet_ships = float(sum(f.ships for f in self.fleets if f.owner == self.player))
+        enemy_planet_ships = float(sum(p.ships for p in self.enemy_planets))
+        enemy_fleet_ships = float(sum(f.ships for f in self.fleets if f.owner != self.player))
+        my_total_ships = my_planet_ships + my_fleet_ships
+        enemy_total_ships = enemy_planet_ships + enemy_fleet_ships
+
+        my_mobile = my_fleet_ships
+        enemy_mobile = enemy_fleet_ships
+
+        closest_frontier_eta = 999.0
+        closest_frontier_distance = 9999.0
+        my_border_exposure = 0.0
+        enemy_border_exposure = 0.0
+        if self.my_planets and self.enemy_planets:
+            for mp in self.my_planets:
+                for ep in self.enemy_planets:
+                    d = dist_xy(mp.x, mp.y, ep.x, ep.y)
+                    closest_frontier_distance = min(closest_frontier_distance, d)
+                    eta = max(1.0, math.ceil(max(1.0, d - mp.radius - ep.radius) / fleet_speed(20)))
+                    closest_frontier_eta = min(closest_frontier_eta, float(eta))
+                    w = 1.0 / max(8.0, d)
+                    my_border_exposure += (ep.production + 0.12 * ep.ships) * w
+                    enemy_border_exposure += (mp.production + 0.12 * mp.ships) * w
+
+        threatened_owned_value = 0.0
+        for p in self.my_planets:
+            eta = first_loss_eta(self, p, horizon=DEFENSE_HORIZON)
+            if eta is None:
+                continue
+            horizon_weight = clamp(1.0 - (eta / max(1.0, DEFENSE_HORIZON)), 0.15, 1.0)
+            threatened_owned_value += self.importance.get(p.id, 1.0) * horizon_weight
+
+        enemy_vulnerability = 0.0
+        for p in self.enemy_planets:
+            owner, proj_ships, _ = simulate_planet(self, p, horizon=24)
+            if owner != p.owner:
+                proj_ships = 0.0
+            local_pressure = float(self.enemy_source_pressure.get(p.id, 0))
+            my_react = self.approximate_reaction_time(self.player, p)
+            prox_mult = 1.0 / max(1.0, float(my_react))
+            weak_bonus = self.enemy_weakness_bonus(p)
+            base = (p.production + 0.25 * self.importance.get(p.id, 1.0))
+            fragility = base / max(4.0, proj_ships + 0.45 * local_pressure)
+            enemy_vulnerability += fragility * prox_mult * weak_bonus
+
+        comet_window_value = 0.0
+        for p in self.planets:
+            if p.id not in self.comet_ids:
+                continue
+            left = self.comet_turns_left(p)
+            if left is None:
+                continue
+            urgency = 1.0 / max(1.0, float(left))
+            salvage_bias = 1.0 + (0.2 if p.owner == self.player else 0.0)
+            comet_window_value += (p.production + 0.3 * p.ships) * urgency * salvage_bias
+
+        raw = {
+            "turn_progress": turn_progress,
+            "turns_remaining": turns_remaining,
+            "neutral_value_remaining": neutral_total_value,
+            "neutral_value_easy": neutral_easy,
+            "neutral_value_contested": neutral_contested,
+            "neutral_value_unsafe": neutral_unsafe,
+            "my_production_share_total": my_prod / max(1.0, total_owned_prod),
+            "my_production_share_vs_strongest_enemy": my_prod / max(1.0, my_prod + strongest_enemy_prod),
+            "my_ship_share_total": my_total_ships / max(1.0, my_total_ships + enemy_total_ships),
+            "my_ship_share_mobile": my_mobile / max(1.0, my_mobile + enemy_mobile),
+            "frontier_contact_closest_eta": closest_frontier_eta if closest_frontier_eta < 999 else 999.0,
+            "frontier_contact_closest_distance": closest_frontier_distance if closest_frontier_distance < 9999 else 9999.0,
+            "frontier_contact_my_exposure": my_border_exposure,
+            "frontier_contact_enemy_exposure": enemy_border_exposure,
+            "threatened_owned_value": threatened_owned_value,
+            "enemy_vulnerability": enemy_vulnerability,
+            "comet_window_value": comet_window_value,
+        }
+
+        normalized = {
+            "turn_progress": raw["turn_progress"],
+            "turns_remaining": clamp(raw["turns_remaining"] / max(1.0, EPISODE_STEPS), 0.0, 1.0),
+            "neutral_value_remaining": 1.0 - math.exp(-raw["neutral_value_remaining"]),
+            "neutral_value_easy": raw["neutral_value_easy"] / max(1e-6, raw["neutral_value_remaining"]),
+            "neutral_value_contested": raw["neutral_value_contested"] / max(1e-6, raw["neutral_value_remaining"]),
+            "neutral_value_unsafe": raw["neutral_value_unsafe"] / max(1e-6, raw["neutral_value_remaining"]),
+            "my_production_share_total": clamp(raw["my_production_share_total"], 0.0, 1.0),
+            "my_production_share_vs_strongest_enemy": clamp(raw["my_production_share_vs_strongest_enemy"], 0.0, 1.0),
+            "my_ship_share_total": clamp(raw["my_ship_share_total"], 0.0, 1.0),
+            "my_ship_share_mobile": clamp(raw["my_ship_share_mobile"], 0.0, 1.0),
+            "frontier_contact_closest_eta": 1.0 / max(1.0, raw["frontier_contact_closest_eta"]),
+            "frontier_contact_closest_distance": 1.0 / max(1.0, raw["frontier_contact_closest_distance"]),
+            "frontier_contact_my_exposure": 1.0 - math.exp(-raw["frontier_contact_my_exposure"] / 8.0),
+            "frontier_contact_enemy_exposure": 1.0 - math.exp(-raw["frontier_contact_enemy_exposure"] / 8.0),
+            "threatened_owned_value": 1.0 - math.exp(-raw["threatened_owned_value"] / 18.0),
+            "enemy_vulnerability": 1.0 - math.exp(-raw["enemy_vulnerability"] / 10.0),
+            "comet_window_value": 1.0 - math.exp(-raw["comet_window_value"] / 6.0),
+        }
+        return PhaseSignals(raw=raw, normalized=normalized)
 
     def _parse_comet_paths(self, comet_groups):
         for group in comet_groups:
@@ -534,6 +728,7 @@ class World:
         if _RUNTIME.game_key != key or (reset_like and _RUNTIME.game_turn > 20):
             _RUNTIME.game_key = key
             _RUNTIME.game_turn = 0
+            _RUNTIME.phase_state = PhaseState()
         return int(_RUNTIME.game_turn)
 
     def is_comet(self, p):
@@ -584,13 +779,93 @@ class World:
         return ans
 
     def phase(self):
-        if self.step < OPENING_END:
-            return "opening"
-        if self.step < MID_END:
-            return "mid"
-        if self.step < PRESSURE_END:
-            return "pressure"
-        return "endgame"
+        scores = self.compute_phase_scores(self.phase_signals)
+        next_phase = self.choose_phase(_RUNTIME.phase_state, scores, self.phase_signals)
+        # Backward-compatibility map for modules that still use legacy names.
+        compat = {
+            "expansion_race": "opening",
+            "border_contest": "mid",
+            "conversion_pressure": "pressure",
+            "final_scoring": "endgame",
+        }
+        return compat.get(next_phase, "mid")
+
+    def compute_phase_scores(self, signals):
+        n = signals.normalized
+        scores = PhaseScores()
+        scores.expansion_race = (
+            1.35 * n["neutral_value_remaining"]
+            + 0.55 * n["neutral_value_easy"]
+            + 0.25 * n["turns_remaining"]
+            - 0.95 * n["turn_progress"]
+            - 0.45 * n["frontier_contact_closest_eta"]
+        )
+        scores.border_contest = (
+            0.95 * n["frontier_contact_closest_eta"]
+            + 0.70 * n["neutral_value_contested"]
+            + 0.55 * n["frontier_contact_my_exposure"]
+            + 0.30 * (1.0 - n["turn_progress"])
+        )
+        scores.conversion_pressure = (
+            1.05 * n["enemy_vulnerability"]
+            + 0.45 * n["my_ship_share_mobile"]
+            + 0.40 * n["frontier_contact_enemy_exposure"]
+            + 0.25 * n["turn_progress"]
+            - 0.35 * n["threatened_owned_value"]
+        )
+        scores.final_scoring = (
+            1.70 * n["turn_progress"]
+            + 1.10 * (1.0 - n["turns_remaining"])
+            + 0.55 * n["my_production_share_total"]
+            + 0.45 * n["my_ship_share_total"]
+            + 0.40 * n["comet_window_value"]
+        )
+        return scores
+
+    def choose_phase(self, prev_state, scores, signals):
+        phase_order = ("expansion_race", "border_contest", "conversion_pressure", "final_scoring")
+        current = prev_state.current_phase if prev_state.current_phase in phase_order else "expansion_race"
+
+        turns_left = max(0, EPISODE_STEPS - self.step)
+        low_turn_lock = turns_left <= 38 or (
+            signals.raw.get("frontier_contact_closest_eta", 999.0) >= max(8.0, turns_left * 0.85)
+            and turns_left <= 56
+        )
+        if low_turn_lock:
+            prev_state.current_phase = "final_scoring"
+            prev_state.hold_turns = 0
+            prev_state.persistence_turns.clear()
+            return "final_scoring"
+
+        margin = 0.14
+        persistence_required = 2
+        min_hold_turns = 5
+        candidate = max(phase_order, key=lambda p: getattr(scores, p))
+        current_score = getattr(scores, current)
+        candidate_score = getattr(scores, candidate)
+
+        prev_state.hold_turns = max(0, prev_state.hold_turns) + 1
+        if candidate != current and candidate_score > current_score + margin and prev_state.hold_turns >= min_hold_turns:
+            sustained = int(prev_state.persistence_turns.get(candidate, 0)) + 1
+            prev_state.persistence_turns[candidate] = sustained
+            if sustained >= persistence_required:
+                prev_state.current_phase = candidate
+                prev_state.confidence = candidate_score - current_score
+                prev_state.hold_turns = 0
+                prev_state.persistence_turns.clear()
+                return candidate
+        else:
+            prev_state.persistence_turns = {k: v for k, v in prev_state.persistence_turns.items() if k == candidate}
+            if candidate == current:
+                prev_state.persistence_turns.clear()
+
+        prev_state.confidence = max(0.0, candidate_score - current_score)
+        return prev_state.current_phase
+
+    def _refresh_phase_overrides(self, signals):
+        emergency_threshold = 0.44
+        threatened_value = signals.normalized.get("threatened_owned_value", 0.0)
+        self.phase_overrides["emergency_defense"] = threatened_value >= emergency_threshold
 
     def turns_remaining(self):
         return max(0, EPISODE_STEPS - self.step)
@@ -669,6 +944,7 @@ class World:
         phase = self.phase()
         return {
             "phase": phase,
+            "emergency_defense": self.phase_overrides.get("emergency_defense", False),
             "my_total": my_total,
             "enemy_total": enemy_total,
             "my_prod": my_prod,

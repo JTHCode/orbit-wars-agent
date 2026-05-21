@@ -22,6 +22,13 @@ This changelog is maintained by agents working in this repository.
 
 ---
 
+## 2026-05-21 — Replace fixed turn phase with score-driven phase state
+
+- Summary: Reworked `World.phase()` to use score-based phase selection from `self.phase_signals`, with margin, persistence, minimum hold time, and an ETA-aware mandatory `final_scoring` lock; also added an emergency defense override flag driven by threatened-owned-value.
+- Why: Reduce phase thrashing, make phase transitions responsive to board state instead of fixed turns, and allow defensive tactics to react immediately under high threat.
+- Impact: Strategic phase now adapts to game state each turn while preserving legacy phase string compatibility; tactical code can key off `modes["emergency_defense"]` / `phase_overrides["emergency_defense"]` for forced defense posture.
+- Files: `orbit_agent/core.py`, `main.py`, `changelog.md`
+
 ## 2026-05-21 — Add agent-maintained changelog and expand agent guidance
 
 - Summary: Added `changelog.md` and expanded `agents.md` with project-specific guidance for modular development, submission build workflow, testing, and maintenance expectations.
