@@ -119,6 +119,14 @@ COMET_EVAC_MIN_SEND = 4
 COMET_EVAC_KEEP = 1
 COMET_EVAC_ATTACK_BONUS = 1.20
 
+# Final-phase evaluator knobs.
+FINAL_TURN_SAFETY_PRIOR = 430
+FINAL_ETA_SAMPLE_CAP = 16
+FINAL_HIGH_VALUE_TOP_K = 6
+FINAL_PAYBACK_WINDOW_PAD = 10
+FINAL_PRESERVATION_MARGIN = -0.18
+FINAL_SWING_RISK_ALERT = 0.55
+
 # Timing debug. Keep False for submissions.
 DEBUG_TIMING_PRINTS = False
 DEBUG_PRINT_EVERY = 50
@@ -697,6 +705,83 @@ class World:
     def turns_remaining(self):
         return max(0, EPISODE_STEPS - self.step)
 
+    def _high_value_targets(self, top_k=FINAL_HIGH_VALUE_TOP_K):
+        ranked = [p for p in self.planets if p.owner != self.player]
+        ranked.sort(key=lambda p: self.importance.get(p.id, 1.0), reverse=True)
+        return ranked[:top_k]
+
+    def _typical_attack_eta(self, targets):
+        etas = []
+        if not targets:
+            return {"samples": [], "median": 999, "p75": 999, "min": 999, "max": 999}
+        for src in sorted(self.my_planets, key=lambda p: p.ships, reverse=True)[:FINAL_ETA_SAMPLE_CAP]:
+            if src.ships < MIN_LAUNCH:
+                continue
+            probe = max(MIN_LAUNCH, min(18, int(src.ships)))
+            for tgt in targets:
+                eta = approximate_eta_between_planets(self, src, tgt, 0, probe)
+                if eta < 999:
+                    etas.append(int(eta))
+        if not etas:
+            return {"samples": [], "median": 999, "p75": 999, "min": 999, "max": 999}
+        etas.sort()
+        n = len(etas)
+        return {
+            "samples": etas,
+            "median": etas[n // 2],
+            "p75": etas[min(n - 1, int(0.75 * (n - 1)))],
+            "min": etas[0],
+            "max": etas[-1],
+        }
+
+    def _late_swing_risk(self, targets, eta_hint):
+        if not targets or not self.enemy_planets:
+            return 0.0
+        horizon = max(6, min(60, int(eta_hint + 6)))
+        risky = 0
+        total = 0
+        for tgt in targets:
+            total += 1
+            for enemy in self.enemy_planets:
+                if enemy.ships < MIN_LAUNCH:
+                    continue
+                eta = approximate_eta_between_planets(self, enemy, tgt, 0, max(MIN_LAUNCH, min(18, int(enemy.ships))))
+                if eta <= horizon:
+                    risky += 1
+                    break
+        return risky / max(1, total)
+
+    def _build_final_evaluator(self):
+        turns_left = self.turns_remaining()
+        targets = self._high_value_targets()
+        eta_dist = self._typical_attack_eta(targets)
+        eta_env = eta_dist["p75"] if eta_dist["p75"] < 999 else eta_dist["median"]
+        payback_scores = []
+        for t in targets:
+            req = int(max(1, t.ships + 1))
+            prod = discounted_production_value(self, t, max(1, eta_dist["median"] if eta_dist["median"] < 999 else 8), PV_GAMMA)
+            denom = max(1.0, req)
+            risk = 1.0
+            if t.owner not in (self.player, NEUTRAL_OWNER):
+                risk += min(0.75, self.enemy_source_pressure.get(t.id, 0) / max(12.0, t.ships + 1.0))
+            payback_scores.append((prod / denom) - 0.30 * risk)
+        capture_payback_score = (sum(payback_scores) / len(payback_scores)) if payback_scores else -1.0
+        late_swing_risk = self._late_swing_risk(targets, eta_env if eta_env < 999 else 20)
+        envelope = max(6, int((eta_env if eta_env < 999 else 14) + FINAL_PAYBACK_WINDOW_PAD))
+        final_scoring = (
+            turns_left <= envelope
+            or (capture_payback_score <= FINAL_PRESERVATION_MARGIN and late_swing_risk >= FINAL_SWING_RISK_ALERT)
+            or self.step >= FINAL_TURN_SAFETY_PRIOR
+        )
+        return {
+            "typical_attack_eta": eta_dist,
+            "turns_remaining": turns_left,
+            "capture_payback_score": capture_payback_score,
+            "late_swing_risk": late_swing_risk,
+            "eta_payoff_envelope": envelope,
+            "final_scoring": final_scoring,
+        }
+
     def _estimate_arrivals(self):
         arrivals = []
         for f in self.fleets:
@@ -769,6 +854,7 @@ class World:
         domination = (my_total - enemy_total) / total
         prod_domination = (my_prod - enemy_prod) / max(1.0, my_prod + enemy_prod)
         phase = self.phase()
+        final_eval = self._build_final_evaluator()
         threatened_owned_value = self._phase_scores()["threatened_owned_value"]
         return {
             "phase": phase,
@@ -781,7 +867,8 @@ class World:
             "is_behind": domination < -0.18 or prod_domination < -0.18,
             "is_ahead": domination > 0.16 or prod_domination > 0.16,
             "is_dominating": domination > 0.34 or prod_domination > 0.30,
-            "is_finishing": phase == "endgame" or self.step >= 400,
+            "is_finishing": final_eval["final_scoring"],
+            "final_eval": final_eval,
             "is_opening": phase == "opening",
             "emergency_defense": threatened_owned_value >= EMERGENCY_DEFENSE_CRITICAL_THREAT,
             "threatened_owned_value": threatened_owned_value,
@@ -1434,7 +1521,7 @@ def post_capture_retake_risk(world, target, capture_eta, surplus_after_capture, 
     This is intentionally approximate: it should price risk and add margin, not replace
     exact combat/launch solving. Known incoming fleets are still handled by simulate_planet.
     """
-    if not world.enemy_planets or world.phase() == "endgame":
+    if not world.enemy_planets or world.modes["is_finishing"]:
         return {"risk": 0.0, "extra_margin": 0, "fastest_delay": 999, "enemy_power": 0.0}
 
     capture_eta = int(max(1, math.ceil(capture_eta)))
@@ -1542,7 +1629,7 @@ def target_extra_margin(world, target, eta):
     elif world.modes["is_dominating"]:
         margin = int(margin * 1.15) + 1
 
-    if world.phase() == "endgame":
+    if world.modes["is_finishing"]:
         margin = max(1, int(margin * 0.45))
     if target.id in world.comet_ids:
         margin = min(margin, 2)
@@ -1616,7 +1703,7 @@ def target_roi_score(world, target, required, eta, source_dist, planned_arrivals
     # V7: approximate post-capture retake risk. Estimate capture surplus from the
     # proposed send amount, then discount/reject fragile captures near enemy sources.
     retake = {"risk": 0.0, "extra_margin": 0}
-    if world.phase() != "endgame":
+    if not world.modes["is_finishing"]:
         owner_at_eta, ships_at_eta, _ = simulate_planet(world, target, eta, planned_arrivals=planned_arrivals)
         if owner_at_eta != world.player:
             surplus_est = max(0.0, float(required) - max(0.0, ships_at_eta))
@@ -1676,7 +1763,7 @@ def target_roi_score(world, target, required, eta, source_dist, planned_arrivals
             score *= 1.32
         else:
             score *= 0.88
-    elif world.phase() == "endgame":
+    elif world.modes["is_finishing"]:
         if eta > world.turns_remaining() - 3:
             return -1e9
         score *= 0.70 if target.owner == NEUTRAL_OWNER else 1.15
@@ -2300,7 +2387,7 @@ class Planner:
                 return None
         required_final = target_required_ships(self.w, target, best.eta, self.planned_arrivals)
         required_final = int(math.ceil(required_final + extra_margin))
-        if self.w.phase() != "endgame":
+        if not self.w.modes["is_finishing"]:
             owner_at_eta, ships_at_eta, _ = simulate_planet(self.w, target, best.eta, planned_arrivals=self.planned_arrivals)
             surplus_est = max(0.0, float(required_final) - max(0.0, ships_at_eta if owner_at_eta != self.w.player else 0.0))
             retake = post_capture_retake_risk(self.w, target, best.eta, surplus_est, self.planned_arrivals)
@@ -2387,7 +2474,7 @@ class Planner:
         extra = [Arrival(target.id, self.w.player, int(p.ships), int(p.eta)) for p in plans]
         capture_eta = max(p.eta for p in plans)
 
-        if self.w.phase() == "endgame":
+        if self.w.modes["is_finishing"]:
             horizon = min(self.w.turns_remaining(), capture_eta + 3)
         else:
             hold_window = 10 if target.owner == NEUTRAL_OWNER else 14
@@ -2412,7 +2499,7 @@ class Planner:
 
         # V7: if the target looks captured under known arrivals, also check whether
         # nearby enemy planets can cheaply retake it after capture.
-        if self.w.phase() != "endgame":
+        if not self.w.modes["is_finishing"]:
             owner_at_cap, ships_at_cap, _ = simulate_planet(
                 self.w,
                 target,
@@ -2431,7 +2518,7 @@ class Planner:
                 if surplus_at_capture < retake["extra_margin"] + max(1, target.production):
                     return False
 
-        if self.w.phase() != "endgame" and target.owner != NEUTRAL_OWNER:
+        if not self.w.modes["is_finishing"] and target.owner != NEUTRAL_OWNER:
             return ships >= max(1, int(0.8 * target.production))
         return ships >= 0
 
@@ -2912,7 +2999,7 @@ class Planner:
         """Chain safe rear surplus into planets that can launch important future attacks."""
         if len(self.moves) >= MAX_MOVES - 1:
             return
-        if self.w.phase() == "endgame" or self.w.step < 34 or len(self.w.my_planets) < 3:
+        if self.w.modes["is_finishing"] or self.w.step < 34 or len(self.w.my_planets) < 3:
             return
         if not self.w.targets:
             return
@@ -2998,7 +3085,7 @@ class Planner:
         """Move rear surplus into planets that have a concrete future attack demand."""
         if len(self.moves) >= MAX_MOVES - 1:
             return
-        if self.w.phase() == "endgame" or self.w.step < 38 or len(self.w.my_planets) < 3:
+        if self.w.modes["is_finishing"] or self.w.step < 38 or len(self.w.my_planets) < 3:
             return
         if not self.w.targets:
             return
@@ -3062,7 +3149,7 @@ class Planner:
     def logistics_funnel(self):
         if len(self.moves) >= MAX_MOVES - 1:
             return
-        if self.w.phase() in ("opening", "endgame") or len(self.w.my_planets) < 4:
+        if self.w.phase() == "opening" or self.w.modes["is_finishing"] or len(self.w.my_planets) < 4:
             return
 
         frontier = self.w.enemy_planets if self.w.enemy_planets else self.w.neutral_planets
