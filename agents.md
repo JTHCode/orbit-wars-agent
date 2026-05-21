@@ -294,4 +294,3 @@ kaggle competitions logs <EPISODE_ID> 0
 
 # Check leaderboard
 kaggle competitions leaderboard orbit-wars -s
-```
