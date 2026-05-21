@@ -23,6 +23,20 @@ This changelog is maintained by agents working in this repository.
 ---
 
 
+## 2026-05-21 — Wire unused phase config knobs and add mode hysteresis
+
+- Summary: Hooked `PHASE_CONFIG.score_weights` into phase score computation, added hysteresis/persistence for strategic mode (`ahead/even/behind`), and removed stale unused phase constants left over from turn-gated policy.
+- Why: Close remaining gaps from the state-driven migration so declared config knobs actually control live behavior and reduce hidden mode flicker.
+- Impact: Phase and mode switching are now more stable and tunable through `PHASE_CONFIG`; less dead/duplicated policy state remains in code.
+- Files: `orbit_agent/core.py`, `main.py`, `changelog.md`
+
+## 2026-05-21 — Activate state-driven phases by default and de-hardcode policy gates
+
+- Summary: Enabled state-driven phases by default, wired `choose_phase()` hysteresis/guardrail values to `PHASE_CONFIG`, and replaced remaining step-only phase gates with phase-aware checks (including nearest-danger and pressure-opportunity gating).
+- Why: Complete the transition from legacy turn buckets to the state-driven phase system and prevent config drift from hardcoded duplicate thresholds.
+- Impact: Active runtime phase policy now follows state signals/hysteresis by default; phase tuning is now centralized in `PHASE_CONFIG` and less brittle across modules.
+- Files: `orbit_agent/core.py`, `main.py`, `agents.md`, `changelog.md`
+
 ## 2026-05-21 — Sync phase-policy docs and benchmark comparison guidance
 
 - Summary: Updated project docs to explicitly reference the new state-driven phase pipeline (`compute_phase_signals` → `compute_phase_scores` → `choose_phase`), hysteresis/override hooks, and rollout flag ownership; added benchmark guidance for controlled old-vs-new phase-policy comparisons.

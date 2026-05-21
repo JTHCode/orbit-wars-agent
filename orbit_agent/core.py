@@ -53,7 +53,7 @@ MAX_DEFENSE_SOURCES = 8
 MAX_SWARM_SOURCES = 5
 
 # Phase rollout flags (default conservative path).
-USE_STATE_DRIVEN_PHASES = False
+USE_STATE_DRIVEN_PHASES = True
 PHASE_SHADOW_MODE = False
 LOG_PHASE_TRANSITIONS = False
 
@@ -94,6 +94,8 @@ PHASE_CONFIG = {
         "forced_final_scoring_step": 400,
         "early_enemy_end_step": 130,
         "nearest_danger_opening_end_step": 120,
+        "pressure_enemy_focus_step": 130,
+        "nearest_danger_step_gate_phase": "expansion_race",
         "emergency_override_domination": -0.34,
         "emergency_override_prod_domination": -0.30,
     },
@@ -111,7 +113,6 @@ LOGISTICS_MIN_SEND = 9
 SALVAGE_MIN_SEND = 8
 
 # Aggression / logistics extension knobs.
-EARLY_ENEMY_END = PHASE_CONFIG["guardrails"]["early_enemy_end_step"]
 EARLY_ENEMY_MAX_ETA = 24
 EARLY_ENEMY_MAX_BUDGET_FRAC = 0.58
 FRONTLINE_STAGING_MIN_SEND = 10
@@ -125,7 +126,6 @@ PV_COMET_MIN_LIFE_AFTER_CAPTURE = 8
 
 # V7 nearest-neighbor danger heuristic knobs.
 NEAREST_DANGER_K = 3
-NEAREST_DANGER_OPENING_END = PHASE_CONFIG["guardrails"]["nearest_danger_opening_end_step"]
 NEAREST_DANGER_MIN_MULT = 0.62
 NEAREST_DANGER_MAX_MULT = 1.18
 
@@ -241,10 +241,12 @@ class PhaseScores:
 @dataclass
 class PhaseState:
     current_phase: str = "expansion_race"
+    current_mode: str = "even"
     confidence: float = 0.0
     hold_turns: int = 0
     persistence_turns: dict = field(default_factory=dict)
-    mode: str = "even"
+    mode_hold_turns: int = 0
+    mode_persistence_turns: dict = field(default_factory=dict)
 
 
 class RuntimeStats:
@@ -882,15 +884,28 @@ class World:
 
     def compute_phase_scores(self, signals):
         n = signals.normalized
+        wcfg = PHASE_CONFIG.get("score_weights", {})
+        step_progress = n["turn_progress"]
+        neutral_pressure = n["neutral_value_remaining"]
+        enemy_pressure = 0.45 * n["frontier_contact_enemy_exposure"] + 0.55 * n["enemy_vulnerability"]
+
+        def base_score(phase_name):
+            w = wcfg.get(phase_name, {})
+            return (
+                float(w.get("step_progress", 0.0)) * step_progress
+                + float(w.get("neutral_pressure", 0.0)) * neutral_pressure
+                + float(w.get("enemy_pressure", 0.0)) * enemy_pressure
+            )
+
         scores = PhaseScores()
-        scores.expansion_race = (
+        scores.expansion_race = base_score("expansion_race") + (
             1.35 * n["neutral_value_remaining"]
             + 0.55 * n["neutral_value_easy"]
             + 0.25 * n["turns_remaining"]
             - 0.95 * n["turn_progress"]
             - 0.45 * n["frontier_contact_closest_eta"]
         )
-        scores.border_contest = (
+        scores.border_contest = base_score("border_contest") + (
             0.95 * n["frontier_contact_closest_eta"]
             + 0.70 * n["neutral_value_contested"]
             + 0.55 * n["frontier_contact_my_exposure"]
@@ -901,7 +916,7 @@ class World:
             + 0.10 * self.modes.get("mode_even", 0.0)
             + 0.38 * self.modes.get("mode_behind", 0.0)
         )
-        scores.conversion_pressure = (
+        scores.conversion_pressure = base_score("conversion_pressure") + (
             1.05 * n["enemy_vulnerability"]
             + 0.45 * n["my_ship_share_mobile"]
             + 0.40 * n["frontier_contact_enemy_exposure"]
@@ -909,7 +924,7 @@ class World:
             + mode_pressure_boost
             - 0.35 * n["threatened_owned_value"]
         )
-        scores.final_scoring = (
+        scores.final_scoring = base_score("final_scoring") + (
             1.70 * n["turn_progress"]
             + 1.10 * (1.0 - n["turns_remaining"])
             + 0.55 * n["my_production_share_total"]
@@ -925,7 +940,10 @@ class World:
         turns_left = max(0, EPISODE_STEPS - self.step)
         typical_eta = max(4, self.typical_attack_eta())
         payoff_window = 9
-        hard_enter = turns_left <= 26
+        guardrails = PHASE_CONFIG.get("guardrails", {})
+        forced_final_step = int(guardrails.get("forced_final_scoring_step", 400))
+        final_entry_step = int(guardrails.get("final_scoring_entry_step", 160))
+        hard_enter = turns_left <= 26 or self.step >= forced_final_step
         if hard_enter:
             prev_state.current_phase = "final_scoring"
             prev_state.hold_turns = 0
@@ -936,16 +954,18 @@ class World:
             signals.normalized.get("neutral_value_remaining", 0.0) < 0.18
             or signals.normalized.get("neutral_value_easy", 0.0) < 0.16
         )
-        low_turn_lock = turns_left <= typical_eta + payoff_window
+        low_turn_lock = self.step >= final_entry_step and turns_left <= typical_eta + payoff_window
         if low_turn_lock and low_payback_confirmation:
             prev_state.current_phase = "final_scoring"
             prev_state.hold_turns = 0
             prev_state.persistence_turns.clear()
             return "final_scoring"
 
-        margin = 0.14
+        margins = PHASE_CONFIG.get("hysteresis_margins", {})
+        hold_cfg = PHASE_CONFIG.get("min_hold_turns", {})
+        margin = float(margins.get("phase_switch", 0.08))
         persistence_required = 2
-        min_hold_turns = 5
+        min_hold_turns = int(hold_cfg.get("phase", 8))
         candidate = max(phase_order, key=lambda p: getattr(scores, p))
         current_score = getattr(scores, current)
         candidate_score = getattr(scores, candidate)
@@ -1108,7 +1128,37 @@ class World:
             "even": mode_even,
             "behind": mode_behind,
         }
-        mode = max(mode_candidates, key=mode_candidates.get)
+        prev_mode = _RUNTIME.phase_state.current_mode if _RUNTIME.phase_state.current_mode in mode_candidates else "even"
+        candidate_mode = max(mode_candidates, key=mode_candidates.get)
+        current_mode_score = mode_candidates.get(prev_mode, 0.0)
+        candidate_mode_score = mode_candidates.get(candidate_mode, 0.0)
+        margins = PHASE_CONFIG.get("hysteresis_margins", {})
+        hold_cfg = PHASE_CONFIG.get("min_hold_turns", {})
+        persistence_cfg = PHASE_CONFIG.get("persistence_turn_thresholds", {})
+        mode_margin = float(margins.get("mode_switch", 0.06))
+        mode_min_hold = int(hold_cfg.get("mode", 6))
+        mode_persist_need = int(persistence_cfg.get(candidate_mode, 2))
+
+        _RUNTIME.phase_state.mode_hold_turns = max(0, _RUNTIME.phase_state.mode_hold_turns) + 1
+        if (
+            candidate_mode != prev_mode
+            and candidate_mode_score > current_mode_score + mode_margin
+            and _RUNTIME.phase_state.mode_hold_turns >= mode_min_hold
+        ):
+            sustained = int(_RUNTIME.phase_state.mode_persistence_turns.get(candidate_mode, 0)) + 1
+            _RUNTIME.phase_state.mode_persistence_turns[candidate_mode] = sustained
+            if sustained >= mode_persist_need:
+                _RUNTIME.phase_state.current_mode = candidate_mode
+                _RUNTIME.phase_state.mode_hold_turns = 0
+                _RUNTIME.phase_state.mode_persistence_turns.clear()
+        else:
+            _RUNTIME.phase_state.mode_persistence_turns = {
+                k: v for k, v in _RUNTIME.phase_state.mode_persistence_turns.items() if k == candidate_mode
+            }
+            if candidate_mode == prev_mode:
+                _RUNTIME.phase_state.mode_persistence_turns.clear()
+
+        mode = _RUNTIME.phase_state.current_mode if _RUNTIME.phase_state.current_mode in mode_candidates else candidate_mode
         phase = self.phase()
         return {
             "phase": phase,
@@ -1951,7 +2001,8 @@ def target_roi_score(world, target, required, eta, source_dist, planned_arrivals
 
     # V7: opening/midgame nearest-owner danger heuristic from the article.
     nearest_mult = 1.0
-    if target.owner == NEUTRAL_OWNER and world.step < NEAREST_DANGER_OPENING_END:
+    nearest_danger_phase = PHASE_CONFIG["guardrails"].get("nearest_danger_step_gate_phase", "expansion_race")
+    if target.owner == NEUTRAL_OWNER and world.is_phase(nearest_danger_phase):
         nearest_mult = nearest_owner_danger_mult(world, target, min(75, max(12, eta)), NEAREST_DANGER_K)
 
     # V7: approximate post-capture retake risk. Estimate capture surplus from the
@@ -2275,7 +2326,7 @@ class Planner:
     def build_pressure_opportunity_missions(self):
         """Targeted non-final enemy pressure without globally lowering all attack thresholds."""
         out = []
-        if self.w.step >= EARLY_ENEMY_END or self.w.is_phase("final_scoring") or not self.w.enemy_planets:
+        if self.w.is_phase("final_scoring") or not self.w.enemy_planets:
             return out
 
         targets = sorted(
@@ -2502,7 +2553,11 @@ class Planner:
             launched = self.w.enemy_source_pressure.get(target.id, 0)
             if launched > 0:
                 value *= 1.0 + min(0.22, launched / max(45.0, target.ships + launched))
-            if self.w.step < EARLY_ENEMY_END and target.ships <= 28 + 4 * target.production:
+            pressure_enemy_focus_step = PHASE_CONFIG["guardrails"].get(
+                "pressure_enemy_focus_step",
+                PHASE_CONFIG["guardrails"].get("early_enemy_end_step", 130),
+            )
+            if (not self.w.phase_at_least("conversion_pressure")) and self.w.step < pressure_enemy_focus_step and target.ships <= 28 + 4 * target.production:
                 value *= 1.18
             if self.w.enemy_planet_count_by_owner.get(target.owner, 0) <= 2:
                 value *= 1.10
