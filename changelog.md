@@ -23,6 +23,13 @@ This changelog is maintained by agents working in this repository.
 ---
 
 
+## 2026-05-21 — Fix phase/mode bootstrap recursion and isolate legacy phase bounds
+
+- Summary: Fixed an initialization-time phase/mode dependency cycle by bootstrapping default mode scores before mode synthesis, made phase scoring robust to absent mode state, and removed direct `_build_modes()` dependence on `phase()` recursion; also inlined legacy turn-phase bounds lookup in `_legacy_turn_phase()` and removed duplicate module-level bound constants.
+- Why: Prevent startup-time phase evaluation from reading uninitialized mode state and reduce stale/duplicated phase-bound constants outside the active state-driven path.
+- Impact: Safer deterministic initialization for state-driven phase selection and cleaner legacy fallback wiring with fewer unused policy constants.
+- Files: `orbit_agent/core.py`, `main.py`, `changelog.md`
+
 ## 2026-05-21 — Wire unused phase config knobs and add mode hysteresis
 
 - Summary: Hooked `PHASE_CONFIG.score_weights` into phase score computation, added hysteresis/persistence for strategic mode (`ahead/even/behind`), and removed stale unused phase constants left over from turn-gated policy.

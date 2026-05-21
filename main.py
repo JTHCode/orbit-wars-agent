@@ -101,9 +101,6 @@ PHASE_CONFIG = {
     },
 }
 
-OPENING_END = PHASE_CONFIG["phase_turn_bounds"]["expansion_race_end"]
-MID_END = PHASE_CONFIG["phase_turn_bounds"]["border_contest_end"]
-PRESSURE_END = PHASE_CONFIG["phase_turn_bounds"]["conversion_pressure_end"]
 SAFE_NEUTRAL_MARGIN = 2
 CONTESTED_NEUTRAL_MARGIN = 4
 HOSTILE_SWARM_TOL = 2
@@ -571,6 +568,9 @@ class World:
         self.phase_signals = self.compute_phase_signals()
         self.phase_overrides = {"emergency_defense": False}
         self._refresh_phase_overrides(self.phase_signals)
+        # Bootstrap defaults so phase scoring can safely reference modes during
+        # initial mode synthesis.
+        self.modes = {"mode_ahead": 0.0, "mode_even": 1.0, "mode_behind": 0.0}
         self.modes = self._build_modes()
         self.reaction_cache = {}
 
@@ -791,11 +791,15 @@ class World:
 
 
     def _legacy_turn_phase(self):
-        if self.step >= PRESSURE_END:
+        bounds = PHASE_CONFIG.get("phase_turn_bounds", {})
+        opening_end = int(bounds.get("expansion_race_end", 60))
+        border_end = int(bounds.get("border_contest_end", 110))
+        pressure_end = int(bounds.get("conversion_pressure_end", 160))
+        if self.step >= pressure_end:
             return "final_scoring"
-        if self.step >= MID_END:
+        if self.step >= border_end:
             return "conversion_pressure"
-        if self.step >= OPENING_END:
+        if self.step >= opening_end:
             return "border_contest"
         return "expansion_race"
 
@@ -911,10 +915,11 @@ class World:
             + 0.55 * n["frontier_contact_my_exposure"]
             + 0.30 * (1.0 - n["turn_progress"])
         )
+        mode_scores = getattr(self, "modes", None) or {}
         mode_pressure_boost = (
-            0.32 * self.modes.get("mode_ahead", 0.0)
-            + 0.10 * self.modes.get("mode_even", 0.0)
-            + 0.38 * self.modes.get("mode_behind", 0.0)
+            0.32 * mode_scores.get("mode_ahead", 0.0)
+            + 0.10 * mode_scores.get("mode_even", 1.0)
+            + 0.38 * mode_scores.get("mode_behind", 0.0)
         )
         scores.conversion_pressure = base_score("conversion_pressure") + (
             1.05 * n["enemy_vulnerability"]
@@ -1159,9 +1164,15 @@ class World:
                 _RUNTIME.phase_state.mode_persistence_turns.clear()
 
         mode = _RUNTIME.phase_state.current_mode if _RUNTIME.phase_state.current_mode in mode_candidates else candidate_mode
-        phase = self.phase()
+        phase = self.current_phase()
+        compat = {
+            "expansion_race": "opening",
+            "border_contest": "mid",
+            "conversion_pressure": "pressure",
+            "final_scoring": "endgame",
+        }
         return {
-            "phase": phase,
+            "phase": compat.get(phase, "mid"),
             "mode": mode,
             "mode_ahead": mode_ahead,
             "mode_even": mode_even,
