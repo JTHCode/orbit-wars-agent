@@ -556,8 +556,135 @@ class World:
             self.arrivals_by_planet[pid].sort(key=lambda a: a.eta)
 
         self.importance = self._planet_importance()
+        self.phase_signals = self.compute_phase_signals()
         self.modes = self._build_modes()
         self.reaction_cache = {}
+
+    def compute_phase_signals(self):
+        """Build phase signals consumed by phase/mode and mission logic."""
+        turn_progress = 0.0 if EPISODE_STEPS <= 0 else clamp(self.step / float(EPISODE_STEPS), 0.0, 1.0)
+        turns_remaining = max(0.0, float(EPISODE_STEPS - self.step))
+
+        neutral_total_value = 0.0
+        neutral_easy = 0.0
+        neutral_contested = 0.0
+        neutral_unsafe = 0.0
+        for p in self.neutral_planets:
+            status, my_t, enemy_t = self.neutral_status(p)
+            eta = max(1.0, float(min(my_t, enemy_t if enemy_t < 999 else my_t)))
+            metric = float(p.production) / max(1.0, float(p.ships)) / eta
+            neutral_total_value += metric
+            if status == "safe":
+                neutral_easy += metric
+            elif status == "contested":
+                neutral_contested += metric
+            else:
+                neutral_unsafe += metric
+
+        my_prod = float(sum(p.production for p in self.my_planets))
+        enemy_prod_by_owner = defaultdict(float)
+        for p in self.enemy_planets:
+            enemy_prod_by_owner[p.owner] += float(p.production)
+        strongest_enemy_prod = max(enemy_prod_by_owner.values(), default=0.0)
+        total_owned_prod = my_prod + sum(enemy_prod_by_owner.values())
+
+        my_planet_ships = float(sum(p.ships for p in self.my_planets))
+        my_fleet_ships = float(sum(f.ships for f in self.fleets if f.owner == self.player))
+        enemy_planet_ships = float(sum(p.ships for p in self.enemy_planets))
+        enemy_fleet_ships = float(sum(f.ships for f in self.fleets if f.owner != self.player))
+        my_total_ships = my_planet_ships + my_fleet_ships
+        enemy_total_ships = enemy_planet_ships + enemy_fleet_ships
+
+        my_mobile = my_fleet_ships
+        enemy_mobile = enemy_fleet_ships
+
+        closest_frontier_eta = 999.0
+        closest_frontier_distance = 9999.0
+        my_border_exposure = 0.0
+        enemy_border_exposure = 0.0
+        if self.my_planets and self.enemy_planets:
+            for mp in self.my_planets:
+                for ep in self.enemy_planets:
+                    d = dist_xy(mp.x, mp.y, ep.x, ep.y)
+                    closest_frontier_distance = min(closest_frontier_distance, d)
+                    eta = max(1.0, math.ceil(max(1.0, d - mp.radius - ep.radius) / fleet_speed(20)))
+                    closest_frontier_eta = min(closest_frontier_eta, float(eta))
+                    w = 1.0 / max(8.0, d)
+                    my_border_exposure += (ep.production + 0.12 * ep.ships) * w
+                    enemy_border_exposure += (mp.production + 0.12 * mp.ships) * w
+
+        threatened_owned_value = 0.0
+        for p in self.my_planets:
+            eta = first_loss_eta(self, p, horizon=DEFENSE_HORIZON)
+            if eta is None:
+                continue
+            horizon_weight = clamp(1.0 - (eta / max(1.0, DEFENSE_HORIZON)), 0.15, 1.0)
+            threatened_owned_value += self.importance.get(p.id, 1.0) * horizon_weight
+
+        enemy_vulnerability = 0.0
+        for p in self.enemy_planets:
+            owner, proj_ships, _ = simulate_planet(self, p, horizon=24)
+            if owner != p.owner:
+                proj_ships = 0.0
+            local_pressure = float(self.enemy_source_pressure.get(p.id, 0))
+            my_react = self.approximate_reaction_time(self.player, p)
+            prox_mult = 1.0 / max(1.0, float(my_react))
+            weak_bonus = self.enemy_weakness_bonus(p)
+            base = (p.production + 0.25 * self.importance.get(p.id, 1.0))
+            fragility = base / max(4.0, proj_ships + 0.45 * local_pressure)
+            enemy_vulnerability += fragility * prox_mult * weak_bonus
+
+        comet_window_value = 0.0
+        for p in self.planets:
+            if p.id not in self.comet_ids:
+                continue
+            left = self.comet_turns_left(p)
+            if left is None:
+                continue
+            urgency = 1.0 / max(1.0, float(left))
+            salvage_bias = 1.0 + (0.2 if p.owner == self.player else 0.0)
+            comet_window_value += (p.production + 0.3 * p.ships) * urgency * salvage_bias
+
+        raw = {
+            "turn_progress": turn_progress,
+            "turns_remaining": turns_remaining,
+            "neutral_value_remaining": neutral_total_value,
+            "neutral_value_easy": neutral_easy,
+            "neutral_value_contested": neutral_contested,
+            "neutral_value_unsafe": neutral_unsafe,
+            "my_production_share_total": my_prod / max(1.0, total_owned_prod),
+            "my_production_share_vs_strongest_enemy": my_prod / max(1.0, my_prod + strongest_enemy_prod),
+            "my_ship_share_total": my_total_ships / max(1.0, my_total_ships + enemy_total_ships),
+            "my_ship_share_mobile": my_mobile / max(1.0, my_mobile + enemy_mobile),
+            "frontier_contact_closest_eta": closest_frontier_eta if closest_frontier_eta < 999 else 999.0,
+            "frontier_contact_closest_distance": closest_frontier_distance if closest_frontier_distance < 9999 else 9999.0,
+            "frontier_contact_my_exposure": my_border_exposure,
+            "frontier_contact_enemy_exposure": enemy_border_exposure,
+            "threatened_owned_value": threatened_owned_value,
+            "enemy_vulnerability": enemy_vulnerability,
+            "comet_window_value": comet_window_value,
+        }
+
+        normalized = {
+            "turn_progress": raw["turn_progress"],
+            "turns_remaining": clamp(raw["turns_remaining"] / max(1.0, EPISODE_STEPS), 0.0, 1.0),
+            "neutral_value_remaining": 1.0 - math.exp(-raw["neutral_value_remaining"]),
+            "neutral_value_easy": raw["neutral_value_easy"] / max(1e-6, raw["neutral_value_remaining"]),
+            "neutral_value_contested": raw["neutral_value_contested"] / max(1e-6, raw["neutral_value_remaining"]),
+            "neutral_value_unsafe": raw["neutral_value_unsafe"] / max(1e-6, raw["neutral_value_remaining"]),
+            "my_production_share_total": clamp(raw["my_production_share_total"], 0.0, 1.0),
+            "my_production_share_vs_strongest_enemy": clamp(raw["my_production_share_vs_strongest_enemy"], 0.0, 1.0),
+            "my_ship_share_total": clamp(raw["my_ship_share_total"], 0.0, 1.0),
+            "my_ship_share_mobile": clamp(raw["my_ship_share_mobile"], 0.0, 1.0),
+            "frontier_contact_closest_eta": 1.0 / max(1.0, raw["frontier_contact_closest_eta"]),
+            "frontier_contact_closest_distance": 1.0 / max(1.0, raw["frontier_contact_closest_distance"]),
+            "frontier_contact_my_exposure": 1.0 - math.exp(-raw["frontier_contact_my_exposure"] / 8.0),
+            "frontier_contact_enemy_exposure": 1.0 - math.exp(-raw["frontier_contact_enemy_exposure"] / 8.0),
+            "threatened_owned_value": 1.0 - math.exp(-raw["threatened_owned_value"] / 18.0),
+            "enemy_vulnerability": 1.0 - math.exp(-raw["enemy_vulnerability"] / 10.0),
+            "comet_window_value": 1.0 - math.exp(-raw["comet_window_value"] / 6.0),
+        }
+        return PhaseSignals(raw=raw, normalized=normalized)
 
     def _parse_comet_paths(self, comet_groups):
         for group in comet_groups:
