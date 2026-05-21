@@ -581,6 +581,9 @@ class World:
         self.modes = self._build_modes()
         # Recompute with full budgeting once phase/mode state is initialized.
         self.available_ships = {p.id: projected_ship_budget(self, p) for p in self.my_planets}
+        # Compute phase once per turn and reuse it at all call sites.
+        self._state_phase_cached, self._state_phase_scores_cached = self._state_driven_phase()
+        self._active_phase_cached = self._state_phase_cached if USE_STATE_DRIVEN_PHASES else self._legacy_turn_phase()
 
     def compute_phase_signals(self):
         """Build phase signals consumed by phase/mode and mission logic."""
@@ -859,8 +862,9 @@ class World:
         }
 
     def phase(self):
-        state_phase, scores = self._state_driven_phase()
-        active_phase = state_phase if USE_STATE_DRIVEN_PHASES else self._legacy_turn_phase()
+        state_phase = self._state_phase_cached
+        scores = self._state_phase_scores_cached
+        active_phase = self._active_phase_cached
         shadow_phase = state_phase if PHASE_SHADOW_MODE else None
         self._log_phase_debug(active_phase, scores, shadow_phase=shadow_phase)
         transition = _RUNTIME.last_phase_transition
@@ -880,6 +884,9 @@ class World:
         return compat.get(active_phase, "mid")
 
     def current_phase(self):
+        cached = getattr(self, "_active_phase_cached", None)
+        if cached is not None:
+            return cached
         state_phase, _ = self._state_driven_phase()
         return state_phase if USE_STATE_DRIVEN_PHASES else self._legacy_turn_phase()
 
