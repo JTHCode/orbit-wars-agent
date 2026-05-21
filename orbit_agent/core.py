@@ -3,7 +3,7 @@
 import math
 import time
 from dataclasses import dataclass, field
-from collections import defaultdict
+from collections import defaultdict, deque
 from itertools import combinations
 
 # ============================================================
@@ -114,6 +114,31 @@ COMET_EVAC_ATTACK_BONUS = 1.20
 # Timing debug. Keep False for submissions.
 DEBUG_TIMING_PRINTS = False
 DEBUG_PRINT_EVERY = 50
+
+
+PHASE_EXPANSION_RACE = "expansion_race"
+PHASE_BORDER_CONTEST = "border_contest"
+PHASE_CONVERSION_PRESSURE = "conversion_pressure"
+PHASE_FINAL_SCORING = "final_scoring"
+
+PHASE_LABELS = (
+    PHASE_EXPANSION_RACE,
+    PHASE_BORDER_CONTEST,
+    PHASE_CONVERSION_PRESSURE,
+    PHASE_FINAL_SCORING,
+)
+
+PHASE_COMPAT_MAP = {
+    PHASE_EXPANSION_RACE: "opening",
+    PHASE_BORDER_CONTEST: "mid",
+    PHASE_CONVERSION_PRESSURE: "pressure",
+    PHASE_FINAL_SCORING: "endgame",
+}
+
+_PHASE_MEMORY = {}
+PHASE_HISTORY_WINDOW = 6
+PHASE_SWITCH_MARGIN = 0.18
+PHASE_MIN_PERSISTENCE = 4
 
 
 @dataclass
@@ -491,6 +516,22 @@ class World:
         for pid in self.arrivals_by_planet:
             self.arrivals_by_planet[pid].sort(key=lambda a: a.eta)
 
+        self.modes_snapshot = self._build_modes_base()
+        self.phase_state = self._init_phase_state()
+        phase_signals = self.compute_phase_signals()
+        phase_scores = self.compute_phase_scores(phase_signals)
+        self.phase_state["current_phase"] = self.select_phase_with_hysteresis(
+            phase_scores,
+            self.phase_state["current_phase"],
+            self.phase_state,
+        )
+        _PHASE_MEMORY[_RUNTIME.game_key] = {
+            "current_phase": self.phase_state["current_phase"],
+            "phase_persistence_turns": self.phase_state["phase_persistence_turns"],
+            "last_phase_change_step": self.phase_state["last_phase_change_step"],
+            "score_history": {k: list(v) for k, v in self.phase_state["score_history"].items()},
+        }
+
         self.importance = self._planet_importance()
         self.modes = self._build_modes()
         self.reaction_cache = {}
@@ -583,14 +624,91 @@ class World:
         self._future_xy_cache[key] = ans
         return ans
 
+    def _init_phase_state(self):
+        key = _RUNTIME.game_key or self._make_game_key(self.obs)
+        prev = _PHASE_MEMORY.get(key, {})
+        hist = {}
+        prev_hist = prev.get("score_history", {})
+        for label in PHASE_LABELS:
+            hist[label] = deque(prev_hist.get(label, []), maxlen=PHASE_HISTORY_WINDOW)
+        return {
+            "current_phase": prev.get("current_phase", PHASE_EXPANSION_RACE),
+            "phase_persistence_turns": int(prev.get("phase_persistence_turns", 0)),
+            "last_phase_change_step": int(prev.get("last_phase_change_step", 0)),
+            "score_history": hist,
+        }
+
+    def compute_phase_signals(self):
+        my_count = len(self.my_planets)
+        neutral_count = len(self.neutral_planets)
+        enemy_count = len(self.enemy_planets)
+        total_count = max(1, len(self.planets))
+        neutral_ratio = neutral_count / total_count
+        enemy_ratio = enemy_count / total_count
+        fleet_ratio = sum(f.ships for f in self.fleets) / max(1.0, sum(p.ships for p in self.planets))
+        turns_remaining = self.turns_remaining()
+        return {
+            "step": float(self.step),
+            "my_count": float(my_count),
+            "neutral_ratio": neutral_ratio,
+            "enemy_ratio": enemy_ratio,
+            "domination": self.modes_snapshot["domination"],
+            "prod_domination": self.modes_snapshot["prod_domination"],
+            "fleet_ratio": fleet_ratio,
+            "turns_remaining": float(turns_remaining),
+        }
+
+    def compute_phase_scores(self, signals):
+        step = signals["step"]
+        scores = {label: 0.0 for label in PHASE_LABELS}
+        scores[PHASE_EXPANSION_RACE] += 1.6 * signals["neutral_ratio"] + 0.5 * (1.0 - signals["enemy_ratio"])
+        scores[PHASE_BORDER_CONTEST] += 1.2 * signals["enemy_ratio"] + 0.8 * abs(signals["domination"])
+        scores[PHASE_CONVERSION_PRESSURE] += 1.0 * signals["fleet_ratio"] + 1.0 * max(0.0, signals["prod_domination"])
+        scores[PHASE_FINAL_SCORING] += 2.2 * (1.0 - min(1.0, signals["turns_remaining"] / 120.0))
+
+        # Soft priors / guardrails only.
+        if step < OPENING_END:
+            scores[PHASE_EXPANSION_RACE] += 0.55
+        elif step < MID_END:
+            scores[PHASE_BORDER_CONTEST] += 0.45
+        elif step < PRESSURE_END:
+            scores[PHASE_CONVERSION_PRESSURE] += 0.35
+        else:
+            scores[PHASE_FINAL_SCORING] += 0.55
+        return scores
+
+    def select_phase_with_hysteresis(self, scores, current_phase, persistence_meta):
+        history = persistence_meta["score_history"]
+        for label, score in scores.items():
+            history[label].append(score)
+        rolling = {label: (sum(vals) / max(1, len(vals))) for label, vals in history.items()}
+
+        best_phase = max(PHASE_LABELS, key=lambda label: rolling[label])
+        if current_phase not in PHASE_LABELS:
+            current_phase = PHASE_EXPANSION_RACE
+        current_score = rolling[current_phase]
+        best_score = rolling[best_phase]
+
+        persistence_turns = int(persistence_meta.get("phase_persistence_turns", 0)) + 1
+        if best_phase != current_phase and (
+            persistence_turns < PHASE_MIN_PERSISTENCE or
+            (best_score - current_score) < PHASE_SWITCH_MARGIN
+        ):
+            best_phase = current_phase
+            persistence_turns += 1
+        elif best_phase != current_phase:
+            persistence_turns = 0
+            persistence_meta["last_phase_change_step"] = self.step
+
+        persistence_meta["phase_persistence_turns"] = persistence_turns
+        persistence_meta["current_phase"] = best_phase
+        return best_phase
+
+    def _compat_phase_label(self, phase_label):
+        return PHASE_COMPAT_MAP.get(phase_label, "opening")
+
     def phase(self):
-        if self.step < OPENING_END:
-            return "opening"
-        if self.step < MID_END:
-            return "mid"
-        if self.step < PRESSURE_END:
-            return "pressure"
-        return "endgame"
+        return self._compat_phase_label(self.phase_state["current_phase"])
 
     def turns_remaining(self):
         return max(0, EPISODE_STEPS - self.step)
@@ -650,7 +768,7 @@ class World:
             vals[p.id] = max(1.0, val)
         return vals
 
-    def _build_modes(self):
+    def _build_modes_base(self):
         my_planet_ships = sum(p.ships for p in self.my_planets)
         my_fleet_ships = sum(f.ships for f in self.fleets if f.owner == self.player)
         my_total = my_planet_ships + my_fleet_ships
@@ -666,9 +784,8 @@ class World:
         total = max(1.0, my_total + enemy_total)
         domination = (my_total - enemy_total) / total
         prod_domination = (my_prod - enemy_prod) / max(1.0, my_prod + enemy_prod)
-        phase = self.phase()
         return {
-            "phase": phase,
+            "phase": None,
             "my_total": my_total,
             "enemy_total": enemy_total,
             "my_prod": my_prod,
@@ -678,9 +795,19 @@ class World:
             "is_behind": domination < -0.18 or prod_domination < -0.18,
             "is_ahead": domination > 0.16 or prod_domination > 0.16,
             "is_dominating": domination > 0.34 or prod_domination > 0.30,
-            "is_finishing": phase == "endgame" or self.step >= 400,
-            "is_opening": phase == "opening",
+            "is_finishing": False,
+            "is_opening": False,
         }
+
+
+    def _build_modes(self):
+        modes = dict(self.modes_snapshot)
+        compat_phase = self._compat_phase_label(self.phase_state["current_phase"])
+        modes["phase"] = compat_phase
+        modes["phase_label"] = self.phase_state["current_phase"]
+        modes["is_opening"] = self.phase_state["current_phase"] == PHASE_EXPANSION_RACE
+        modes["is_finishing"] = self.phase_state["current_phase"] == PHASE_FINAL_SCORING or self.step >= 400
+        return modes
 
     def comet_turns_left(self, comet):
         return comet_remaining_life_from_paths(self.comet_path_by_id, comet.id, exclude_current=True)
