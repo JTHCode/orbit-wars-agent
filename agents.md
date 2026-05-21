@@ -4,7 +4,6 @@ This guide walks you through building an agent, testing it locally, and submitti
 
 ## Repo Structure
 
-- `orbit-roi-v7.ipynb`: original notebook workflow and experimentation history.
 - `orbit_agent/core.py`: primary production agent logic used for submission builds.
 - `orbit_agent/benchmark.py`: reproducible A/B benchmark harness and seed buckets.
 - `orbit_agent/__init__.py`: package exports for `agent` and `get_agent_stats`.
