@@ -52,6 +52,11 @@ MAX_ATTACK_SOURCES = 7
 MAX_DEFENSE_SOURCES = 8
 MAX_SWARM_SOURCES = 5
 
+# Phase rollout flags (default conservative path).
+USE_STATE_DRIVEN_PHASES = False
+PHASE_SHADOW_MODE = False
+LOG_PHASE_TRANSITIONS = False
+
 # Phase subsystem configuration.
 PHASE_CONFIG = {
     "canonical_order": (
@@ -253,6 +258,8 @@ class RuntimeStats:
         self.last = 0.0
         self.last_error = None
         self.phase_state = PhaseState()
+        self.last_phase_debug = {}
+        self.last_phase_transition = None
 
     def record(self, elapsed):
         self.turns += 1
@@ -273,6 +280,8 @@ class RuntimeStats:
             "max_turn_time": round(self.max_t, 5),
             "last_turn_time": round(self.last, 5),
             "last_error": self.last_error,
+            "phase_debug": self.last_phase_debug,
+            "phase_transition": self.last_phase_transition,
         }
 
 
@@ -778,9 +787,75 @@ class World:
         self._future_xy_cache[key] = ans
         return ans
 
-    def phase(self):
+
+    def _legacy_turn_phase(self):
+        if self.step >= PRESSURE_END:
+            return "final_scoring"
+        if self.step >= MID_END:
+            return "conversion_pressure"
+        if self.step >= OPENING_END:
+            return "border_contest"
+        return "expansion_race"
+
+    def _state_driven_phase(self):
         scores = self.compute_phase_scores(self.phase_signals)
-        next_phase = self.choose_phase(_RUNTIME.phase_state, scores, self.phase_signals)
+        return self.choose_phase(_RUNTIME.phase_state, scores, self.phase_signals), scores
+
+    def _log_phase_debug(self, active_phase, scores, shadow_phase=None):
+        n = self.phase_signals.normalized
+        tracked = (
+            "turn_progress",
+            "neutral_value_remaining",
+            "neutral_value_easy",
+            "neutral_value_contested",
+            "frontier_contact_closest_eta",
+            "frontier_contact_my_exposure",
+            "frontier_contact_enemy_exposure",
+            "threatened_owned_value",
+            "enemy_vulnerability",
+            "my_ship_share_total",
+            "my_ship_share_mobile",
+            "my_production_share_total",
+            "comet_window_value",
+        )
+        core = {k: round(float(n.get(k, 0.0)), 4) for k in tracked}
+        score_map = {
+            "expansion_race": round(float(scores.expansion_race), 4),
+            "border_contest": round(float(scores.border_contest), 4),
+            "conversion_pressure": round(float(scores.conversion_pressure), 4),
+            "final_scoring": round(float(scores.final_scoring), 4),
+        }
+        shadow = {"enabled": bool(PHASE_SHADOW_MODE), "state_driven_phase": shadow_phase}
+        if active_phase == shadow_phase or shadow_phase is None:
+            shadow["match"] = True
+        else:
+            shadow["match"] = False
+
+        _RUNTIME.last_phase_debug = {
+            "active_phase": active_phase,
+            "phase_scores": score_map,
+            "core_signals": core,
+            "hysteresis": {
+                "hold_turns": int(_RUNTIME.phase_state.hold_turns),
+                "confidence": round(float(_RUNTIME.phase_state.confidence), 4),
+                "persistence_turns": dict(_RUNTIME.phase_state.persistence_turns),
+            },
+            "override_flags": dict(self.phase_overrides),
+            "shadow": shadow,
+        }
+
+    def phase(self):
+        state_phase, scores = self._state_driven_phase()
+        active_phase = state_phase if USE_STATE_DRIVEN_PHASES else self._legacy_turn_phase()
+        shadow_phase = state_phase if PHASE_SHADOW_MODE else None
+        self._log_phase_debug(active_phase, scores, shadow_phase=shadow_phase)
+        transition = _RUNTIME.last_phase_transition
+        if transition is None or transition.get("to") != active_phase:
+            top_signals = sorted(self.phase_signals.normalized.items(), key=lambda kv: abs(kv[1]), reverse=True)[:4]
+            top_signals = [{"signal": k, "value": round(float(v), 4)} for k, v in top_signals]
+            _RUNTIME.last_phase_transition = {"turn": int(self.step), "from": None if transition is None else transition.get("to"), "to": active_phase, "top_signals": top_signals}
+            if LOG_PHASE_TRANSITIONS:
+                print("phase_transition", _RUNTIME.last_phase_transition)
         # Backward-compatibility map for modules that still use legacy names.
         compat = {
             "expansion_race": "opening",
@@ -788,11 +863,11 @@ class World:
             "conversion_pressure": "pressure",
             "final_scoring": "endgame",
         }
-        return compat.get(next_phase, "mid")
+        return compat.get(active_phase, "mid")
 
     def current_phase(self):
-        scores = self.compute_phase_scores(self.phase_signals)
-        return self.choose_phase(_RUNTIME.phase_state, scores, self.phase_signals)
+        state_phase, _ = self._state_driven_phase()
+        return state_phase if USE_STATE_DRIVEN_PHASES else self._legacy_turn_phase()
 
     def is_phase(self, phase_name):
         return self.current_phase() == phase_name
