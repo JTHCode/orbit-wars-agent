@@ -2,6 +2,17 @@
 
 This guide walks you through building an agent, testing it locally, and submitting it to the Orbit Wars competition on Kaggle.
 
+## Repo Structure
+
+- `orbit-roi-v7.ipynb`: original notebook workflow and experimentation history.
+- `orbit_agent/core.py`: primary production agent logic used for submission builds.
+- `orbit_agent/benchmark.py`: reproducible A/B benchmark harness and seed buckets.
+- `orbit_agent/__init__.py`: package exports for `agent` and `get_agent_stats`.
+- `scripts/build_submission.py`: build script that generates a Kaggle-ready single-file `main.py`.
+- `main.py`: generated submission artifact (rebuild before submitting).
+
+**Maintenance rule for agents:** If you add, remove, rename, or repurpose repository files/folders in a way that changes this layout, you must update this Repo Structure section in the same change.
+
 ## Game Overview
 
 Orbit Wars is a real-time strategy game on a 100x100 board with a sun at the center. Players conquer planets by sending fleets of ships between them.
