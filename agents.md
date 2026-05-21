@@ -37,7 +37,10 @@ This guide walks you through building an agent, testing it locally, and submitti
   - `_refresh_phase_overrides()` (emergency defense override),
   - `phase()` / `current_phase()` (active vs shadow/legacy wiring).
 - Runtime rollout behavior is controlled by `USE_STATE_DRIVEN_PHASES` and `PHASE_SHADOW_MODE` in `orbit_agent/core.py` (and mirrored in generated `main.py` after build).
+- Current release policy: `USE_STATE_DRIVEN_PHASES` should remain the explicit source-of-truth switch for active policy. Any default flip of this flag must include benchmark evidence and a `changelog.md` entry summarizing before/after results.
 - If you tune any phase constants (`PHASE_CONFIG`), weights, thresholds, or hysteresis guards, update `changelog.md` with the before/after policy intent and expected tactical impact.
+- Keep phase thresholds/hysteresis in `PHASE_CONFIG` as a single source of truth; avoid introducing hardcoded duplicates in `choose_phase()` or mission gates.
+- Phase API contract for new code: prefer `current_phase()` / `is_phase()` / `phase_at_least()`; `phase()` exists for legacy compatibility and returns legacy names.
 
 ### Safe change workflow for agents
 
