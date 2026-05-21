@@ -848,11 +848,21 @@ class World:
         current = prev_state.current_phase if prev_state.current_phase in phase_order else "expansion_race"
 
         turns_left = max(0, EPISODE_STEPS - self.step)
-        low_turn_lock = turns_left <= 38 or (
-            signals.raw.get("frontier_contact_closest_eta", 999.0) >= max(8.0, turns_left * 0.85)
-            and turns_left <= 56
+        typical_eta = max(4, self.typical_attack_eta())
+        payoff_window = 9
+        hard_enter = turns_left <= 26
+        if hard_enter:
+            prev_state.current_phase = "final_scoring"
+            prev_state.hold_turns = 0
+            prev_state.persistence_turns.clear()
+            return "final_scoring"
+
+        low_payback_confirmation = (
+            signals.normalized.get("neutral_value_remaining", 0.0) < 0.18
+            or signals.normalized.get("neutral_value_easy", 0.0) < 0.16
         )
-        if low_turn_lock:
+        low_turn_lock = turns_left <= typical_eta + payoff_window
+        if low_turn_lock and low_payback_confirmation:
             prev_state.current_phase = "final_scoring"
             prev_state.hold_turns = 0
             prev_state.persistence_turns.clear()
@@ -890,6 +900,40 @@ class World:
 
     def turns_remaining(self):
         return max(0, EPISODE_STEPS - self.step)
+
+
+    def typical_attack_eta(self):
+        """Estimate a typical meaningful attack ETA from current source/target graph."""
+        etas = []
+        for target in self.targets:
+            if target.owner == self.player:
+                continue
+            best = None
+            for src in self.my_planets:
+                avail = max(0.0, self.available_ships.get(src.id, 0.0))
+                if avail < MIN_LAUNCH:
+                    continue
+                probe = int(min(avail, max(MIN_LAUNCH, 10 if target.owner == NEUTRAL_OWNER else 14)))
+                sol = solve_launch_to_planet(self, src, target, probe, max_turns=ATTACK_HORIZON)
+                if sol is None:
+                    continue
+                best = sol.eta if best is None else min(best, sol.eta)
+            if best is not None:
+                etas.append(int(best))
+        if not etas:
+            return 18
+        etas.sort()
+        return int(etas[len(etas) // 2])
+
+    def estimate_capture_payback(self, target, eta, required):
+        """Estimate production payback turns for a candidate capture before game end."""
+        eta = int(max(1, math.ceil(eta)))
+        turns_left_after_arrival = max(0, self.turns_remaining() - eta)
+        if turns_left_after_arrival <= 0:
+            return 10**6
+        if required <= 0:
+            return 0.0
+        return float(required) / max(1.0, float(target.production))
 
     def _estimate_arrivals(self):
         arrivals = []
@@ -2547,10 +2591,23 @@ class Planner:
             sol = self.settle_capture_plan(src, target, required)
             if sol is None or sol.eta > ATTACK_HORIZON:
                 continue
+            if self.w.is_phase("final_scoring") and (self.w.step + sol.eta > EPISODE_STEPS):
+                continue
             if not self.group_captures(target, [sol]):
                 continue
             sol.kind = "capture"
             score = target_roi_score(self.w, target, sol.ships, sol.eta, info["dist"], self.planned_arrivals)
+            if self.w.is_phase("final_scoring"):
+                payback = self.w.estimate_capture_payback(target, sol.eta, sol.ships)
+                if target.owner == NEUTRAL_OWNER and payback > max(2.0, self.w.turns_remaining() - sol.eta):
+                    continue
+                ship_swing = target.ships if target.owner not in (self.w.player, NEUTRAL_OWNER) else 0.0
+                defense_preserve = 0.0
+                if target.owner == self.w.player:
+                    loss_eta = first_loss_eta(self.w, target, max(10, self.w.turns_remaining()), self.planned_arrivals, self.committed)
+                    if loss_eta is not None:
+                        defense_preserve = 14.0 / max(1.0, float(loss_eta))
+                score += 0.16 * ship_swing + defense_preserve
             if score < self.capture_score_floor(target):
                 continue
             sol.score = score
