@@ -52,10 +52,51 @@ MAX_ATTACK_SOURCES = 7
 MAX_DEFENSE_SOURCES = 8
 MAX_SWARM_SOURCES = 5
 
-# Strategy knobs.
-OPENING_END = 60
-MID_END = 110
-PRESSURE_END = 160
+# Phase subsystem configuration.
+PHASE_CONFIG = {
+    "canonical_order": (
+        "expansion_race",
+        "border_contest",
+        "conversion_pressure",
+        "final_scoring",
+    ),
+    "score_weights": {
+        "expansion_race": {"step_progress": -0.60, "neutral_pressure": 1.00, "enemy_pressure": -0.35},
+        "border_contest": {"step_progress": -0.15, "neutral_pressure": 0.65, "enemy_pressure": 0.55},
+        "conversion_pressure": {"step_progress": 0.20, "neutral_pressure": 0.15, "enemy_pressure": 1.00},
+        "final_scoring": {"step_progress": 1.00, "neutral_pressure": -0.30, "enemy_pressure": 0.40},
+    },
+    "phase_turn_bounds": {
+        "expansion_race_end": 60,
+        "border_contest_end": 110,
+        "conversion_pressure_end": 160,
+    },
+    "hysteresis_margins": {
+        "phase_switch": 0.08,
+        "mode_switch": 0.06,
+    },
+    "min_hold_turns": {
+        "phase": 8,
+        "mode": 6,
+    },
+    "persistence_turn_thresholds": {
+        "ahead": 10,
+        "even": 7,
+        "behind": 10,
+    },
+    "guardrails": {
+        "final_scoring_entry_step": 160,
+        "forced_final_scoring_step": 400,
+        "early_enemy_end_step": 130,
+        "nearest_danger_opening_end_step": 120,
+        "emergency_override_domination": -0.34,
+        "emergency_override_prod_domination": -0.30,
+    },
+}
+
+OPENING_END = PHASE_CONFIG["phase_turn_bounds"]["expansion_race_end"]
+MID_END = PHASE_CONFIG["phase_turn_bounds"]["border_contest_end"]
+PRESSURE_END = PHASE_CONFIG["phase_turn_bounds"]["conversion_pressure_end"]
 SAFE_NEUTRAL_MARGIN = 2
 CONTESTED_NEUTRAL_MARGIN = 4
 HOSTILE_SWARM_TOL = 2
@@ -65,7 +106,7 @@ LOGISTICS_MIN_SEND = 9
 SALVAGE_MIN_SEND = 8
 
 # Aggression / logistics extension knobs.
-EARLY_ENEMY_END = 130
+EARLY_ENEMY_END = PHASE_CONFIG["guardrails"]["early_enemy_end_step"]
 EARLY_ENEMY_MAX_ETA = 24
 EARLY_ENEMY_MAX_BUDGET_FRAC = 0.58
 FRONTLINE_STAGING_MIN_SEND = 10
@@ -79,7 +120,7 @@ PV_COMET_MIN_LIFE_AFTER_CAPTURE = 8
 
 # V7 nearest-neighbor danger heuristic knobs.
 NEAREST_DANGER_K = 3
-NEAREST_DANGER_OPENING_END = 120
+NEAREST_DANGER_OPENING_END = PHASE_CONFIG["guardrails"]["nearest_danger_opening_end_step"]
 NEAREST_DANGER_MIN_MULT = 0.62
 NEAREST_DANGER_MAX_MULT = 1.18
 
@@ -176,6 +217,29 @@ class Mission:
     eta: int = 0
     deadline: int = 0
     note: str = ""
+
+
+@dataclass
+class PhaseSignals:
+    raw: dict = field(default_factory=dict)
+    normalized: dict = field(default_factory=dict)
+
+
+@dataclass
+class PhaseScores:
+    expansion_race: float = 0.0
+    border_contest: float = 0.0
+    conversion_pressure: float = 0.0
+    final_scoring: float = 0.0
+
+
+@dataclass
+class PhaseState:
+    current_phase: str = "expansion_race"
+    confidence: float = 0.0
+    hold_turns: int = 0
+    persistence_turns: dict = field(default_factory=dict)
+    mode: str = "even"
 
 
 class RuntimeStats:
