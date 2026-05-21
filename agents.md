@@ -28,6 +28,17 @@ This guide walks you through building an agent, testing it locally, and submitti
 - `scripts/build_submission.py`: deterministic build path from modular source to Kaggle `main.py`.
 - Keep benchmark-only code out of production agent paths.
 
+### Phase policy references (state-driven phases + hysteresis)
+
+- Canonical phase policy implementation lives in `orbit_agent/core.py` on:
+  - `compute_phase_signals()` (normalized board-state signals),
+  - `compute_phase_scores()` (phase scoring),
+  - `choose_phase()` (margin + persistence + hold-turn hysteresis),
+  - `_refresh_phase_overrides()` (emergency defense override),
+  - `phase()` / `current_phase()` (active vs shadow/legacy wiring).
+- Runtime rollout behavior is controlled by `USE_STATE_DRIVEN_PHASES` and `PHASE_SHADOW_MODE` in `orbit_agent/core.py` (and mirrored in generated `main.py` after build).
+- If you tune any phase constants (`PHASE_CONFIG`), weights, thresholds, or hysteresis guards, update `changelog.md` with the before/after policy intent and expected tactical impact.
+
 ### Safe change workflow for agents
 
 1. Read `agents.md`, `competition_overview.md`, and recent `changelog.md` entries before implementing.
@@ -51,6 +62,10 @@ This guide walks you through building an agent, testing it locally, and submitti
   - `python -m py_compile orbit_agent/core.py orbit_agent/benchmark.py main.py scripts/build_submission.py`
 - For behavioral changes, run at least one local game smoke test before finalizing.
 - For performance/strategy changes, prefer running `run_ab_benchmark` in `orbit_agent/benchmark.py` with fixed seeds.
+- For phase-policy updates, benchmark old vs new policy explicitly by toggling rollout flags:
+  - Baseline (legacy active, state-driven shadow): `USE_STATE_DRIVEN_PHASES = False`, `PHASE_SHADOW_MODE = True`
+  - Candidate (state-driven active): `USE_STATE_DRIVEN_PHASES = True`, `PHASE_SHADOW_MODE = False`
+  - Keep the same seed buckets and episode length for both runs, then compare total wins and per-archetype wins.
 
 ### Documentation maintenance expectations
 
