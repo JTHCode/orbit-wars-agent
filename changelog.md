@@ -23,6 +23,13 @@ This changelog is maintained by agents working in this repository.
 ---
 
 
+## 2026-05-21 — Sync phase-policy docs and benchmark comparison guidance
+
+- Summary: Updated project docs to explicitly reference the new state-driven phase pipeline (`compute_phase_signals` → `compute_phase_scores` → `choose_phase`), hysteresis/override hooks, and rollout flag ownership; added benchmark guidance for controlled old-vs-new phase-policy comparisons.
+- Why: Ensure future agent changes are anchored to the correct source-of-truth phase functions and evaluated with apples-to-apples benchmark methodology.
+- Impact: Documentation/workflow only; no runtime behavior changes.
+- Files: `agents.md`, `changelog.md`
+
 ## 2026-05-21 — Add phase debug telemetry and guarded rollout flags
 
 - Summary: Added lightweight phase telemetry through `get_agent_stats()` including active phase, phase scores, core normalized signals, hysteresis counters, override flags, and last transition metadata; introduced rollout flags for state-driven phases and optional shadow comparison mode.
