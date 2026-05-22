@@ -1443,6 +1443,58 @@ def _candidate_viable(source, tx, ty, target_radius, speed, movement_turn):
     return movement_gap <= movement_tol or endpoint_gap <= endpoint_tol, min(movement_gap, endpoint_gap), angle
 
 
+def build_launch_lane_candidates(world, source, target, speed, max_turns=ATTACK_HORIZON):
+    """Build geometric interception candidates (angle, movement_turn, gap) without full tracing."""
+    max_turns = int(max(1, max_turns))
+    seen = set()
+    candidates = []
+    for movement_turn in range(1, max_turns + 1):
+        sample_turns = [movement_turn - 1, movement_turn]
+        if world.is_orbiting(target) or world.is_comet(target):
+            sample_turns.append(movement_turn - 0.5)
+
+        local = []
+        for target_turn in sample_turns:
+            pxy = world.future_xy(target, max(0.0, target_turn))
+            if pxy is None:
+                continue
+            ok, gap, angle = _candidate_viable(source, pxy[0], pxy[1], target.radius, speed, movement_turn)
+            if ok:
+                local.append((gap, angle))
+
+        local.sort(key=lambda x: x[0])
+        for gap, angle in local[:5]:
+            key = round(angle, 7)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append((gap, movement_turn, angle))
+
+    candidates.sort(key=lambda x: (x[1], x[0]))
+    return candidates
+
+
+def solve_launch_discrete_from_candidates(world, source, target, ships, max_turns, candidates):
+    """Validate precomputed candidates with full turn-order tracing."""
+    for _gap, movement_turn, angle in candidates:
+        sx, sy = launch_xy(source, angle)
+        if not is_in_bounds(sx, sy):
+            continue
+        hit_planet, hit_eta, _step = trace_fleet_until_collision(
+            world,
+            sx,
+            sy,
+            angle,
+            ships,
+            min(max_turns, movement_turn + 2),
+            source.id,
+            target.id,
+        )
+        if hit_planet is not None and hit_planet.id == target.id and hit_eta <= max_turns:
+            return LaunchPlan(source.id, target.id, int(ships), angle, int(hit_eta))
+    return None
+
+
 def solve_launch_discrete(world, source, target, ships, max_turns=ATTACK_HORIZON, require_clear=True):
     """Turn-order-validated interception search. Returns a LaunchPlan or None."""
     if ships < 1 or source.id == target.id:
@@ -1450,52 +1502,8 @@ def solve_launch_discrete(world, source, target, ships, max_turns=ATTACK_HORIZON
 
     speed = fleet_speed(ships)
     max_turns = int(max(1, max_turns))
-    seen = set()
-
-    for movement_turn in range(1, max_turns + 1):
-        sample_turns = [movement_turn - 1, movement_turn]
-
-        # A midpoint candidate helps orbiting planets/comets whose sweep catches
-        # the fleet after the fleet movement step.
-        if world.is_orbiting(target) or world.is_comet(target):
-            sample_turns.append(movement_turn - 0.5)
-
-        candidates = []
-        for target_turn in sample_turns:
-            pxy = world.future_xy(target, max(0.0, target_turn))
-            if pxy is None:
-                continue
-            ok, gap, angle = _candidate_viable(
-                source, pxy[0], pxy[1], target.radius, speed, movement_turn
-            )
-            if ok:
-                candidates.append((gap, angle))
-
-        candidates.sort(key=lambda x: x[0])
-
-        for _gap, angle in candidates[:5]:
-            key = round(angle, 7)
-            if key in seen:
-                continue
-            seen.add(key)
-            sx, sy = launch_xy(source, angle)
-            if not is_in_bounds(sx, sy):
-                continue
-
-            hit_planet, hit_eta, _step = trace_fleet_until_collision(
-                world,
-                sx,
-                sy,
-                angle,
-                ships,
-                min(max_turns, movement_turn + 2),
-                source.id,
-                target.id,
-            )
-            if hit_planet is not None and hit_planet.id == target.id and hit_eta <= max_turns:
-                return LaunchPlan(source.id, target.id, int(ships), angle, int(hit_eta))
-
-    return None
+    candidates = build_launch_lane_candidates(world, source, target, speed, max_turns)
+    return solve_launch_discrete_from_candidates(world, source, target, ships, max_turns, candidates)
 
 
 def path_is_clear(world, source, target, angle, speed, eta):
@@ -2132,6 +2140,7 @@ class Planner:
         self.shot_cache = {}
         self.source_info_cache = {}
         self.direct_score_cache = {}
+        self.lane_cache = {}
         self.start_time = time.perf_counter()
 
     def current_available(self, p):
@@ -2158,7 +2167,12 @@ class Planner:
                 cached.score,
                 cached.kind,
             )
-        solved = solve_launch_discrete(self.w, source, target, ships, max_turns, require_clear)
+        lane_key = (source.id, target.id, round(fleet_speed(ships), 3), int(max_turns))
+        candidates = self.lane_cache.get(lane_key)
+        if candidates is None:
+            candidates = build_launch_lane_candidates(self.w, source, target, fleet_speed(ships), max_turns)
+            self.lane_cache[lane_key] = candidates
+        solved = solve_launch_discrete_from_candidates(self.w, source, target, ships, int(max_turns), candidates)
         self.shot_cache[key] = solved
         if solved is None:
             return None

@@ -23,6 +23,14 @@ This changelog is maintained by agents working in this repository.
 ---
 
 
+## 2026-05-22 — Add interception lane cache to reduce per-turn solve cost
+
+- Summary: Refactored launch solving into a two-stage path: geometric lane candidate generation (`source->target`) and cached reuse of those candidates before final turn-order trace validation.
+- Why: `solve_launch_discrete` and repeated `trace_fleet_until_collision` calls were a dominant runtime hotspot during planning loops.
+- Impact: Fewer repeated full-trace simulations for the same source/target/speed/max-turn envelope; launch legality/accuracy preserved by retaining final collision trace checks.
+- Files: `orbit_agent/core.py`, `main.py`, `changelog.md`
+
+
 ## 2026-05-21 — Fix phase/mode bootstrap recursion and isolate legacy phase bounds
 
 - Summary: Fixed an initialization-time phase/mode dependency cycle by bootstrapping default mode scores before mode synthesis, made phase scoring robust to absent mode state, and removed direct `_build_modes()` dependence on `phase()` recursion; also inlined legacy turn-phase bounds lookup in `_legacy_turn_phase()` and removed duplicate module-level bound constants.
