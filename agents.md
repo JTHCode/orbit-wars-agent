@@ -9,6 +9,7 @@ This guide walks you through building an agent, testing it locally, and submitti
 - `orbit_agent/__init__.py`: package exports for `agent` and `get_agent_stats`.
 - `scripts/build_submission.py`: build script that generates a Kaggle-ready single-file `main.py`.
 - `main.py`: generated submission artifact (rebuild before submitting).
+- `test_agent.py`: a simple orbit wars agent that can be used to test games with our working agent.
 
 **Maintenance rule for agents:** If you add, remove, rename, or repurpose repository files/folders in a way that changes this layout, you must update this Repo Structure section in the same change.
 
@@ -27,20 +28,6 @@ This guide walks you through building an agent, testing it locally, and submitti
 - `orbit_agent/benchmark.py`: local A/B benchmark harness only (no competition runtime dependency).
 - `scripts/build_submission.py`: deterministic build path from modular source to Kaggle `main.py`.
 - Keep benchmark-only code out of production agent paths.
-
-### Phase policy references (state-driven phases + hysteresis)
-
-- Canonical phase policy implementation lives in `orbit_agent/core.py` on:
-  - `compute_phase_signals()` (normalized board-state signals),
-  - `compute_phase_scores()` (phase scoring),
-  - `choose_phase()` (margin + persistence + hold-turn hysteresis),
-  - `_refresh_phase_overrides()` (emergency defense override),
-  - `phase()` / `current_phase()` (active vs shadow/legacy wiring).
-- Runtime rollout behavior is controlled by `USE_STATE_DRIVEN_PHASES` and `PHASE_SHADOW_MODE` in `orbit_agent/core.py` (and mirrored in generated `main.py` after build).
-- Current release policy: `USE_STATE_DRIVEN_PHASES` should remain the explicit source-of-truth switch for active policy. Any default flip of this flag must include benchmark evidence and a `changelog.md` entry summarizing before/after results.
-- If you tune any phase constants (`PHASE_CONFIG`), weights, thresholds, or hysteresis guards, update `changelog.md` with the before/after policy intent and expected tactical impact.
-- Keep phase thresholds/hysteresis in `PHASE_CONFIG` as a single source of truth; avoid introducing hardcoded duplicates in `choose_phase()` or mission gates.
-- Phase API contract for new code: prefer `current_phase()` / `is_phase()` / `phase_at_least()`; `phase()` exists for legacy compatibility and returns legacy names.
 
 ### Safe change workflow for agents
 
@@ -89,7 +76,7 @@ Orbit Wars is a real-time strategy game on a 100x100 board with a sun at the cen
 - **Comets**: temporary planets that fly through the board on elliptical paths
 - **Win condition**: highest ship count (planets + fleets) when time runs out, or last player standing
 
-See [README.md](README.md) for full rules and configuration defaults.
+See [competition_overview.md](competition_overview.md) for full rules and configuration defaults.
 
 ## Your Agent
 
